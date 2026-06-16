@@ -31,9 +31,10 @@ def to_natural(ot):
 
 
 def unique_ots(n, fname):
-    return list(unify(list(read_order_types(
-        f"tests/otdb/otypes/{fname}", n=n
-    ))))
+    path = f"tests/otdb/otypes/{fname}"
+    if not Path(path).exists():
+        pytest.skip(f"{path} not found — run tests/otdb/download.py first")
+    return list(unify(list(read_order_types(path, n=n))))
 
 
 def roundtrip(ots, fmt, *, n=None, extra_read_kwargs=None):
@@ -251,7 +252,10 @@ class TestPointBinary:
 
     def test_b08_legacy_alias(self):
         """b08 is a legacy alias for pb08 (OTDB files)."""
-        ots = list(read_order_types("tests/otdb/otypes/otypes04.b08", n=4))
+        path = "tests/otdb/otypes/otypes04.b08"
+        if not Path(path).exists():
+            pytest.skip(f"{path} not found — run tests/otdb/download.py first")
+        ots = list(read_order_types(path, n=4))
         assert len(ots) == 2
 
     def test_multiple_pb08(self):

@@ -102,6 +102,8 @@ class TestCrossings:
         from pyotlib2.algorithms.crossings import count_crossing_families
         from pyotlib2.algorithms.polygon_count import count_crossings, count_polygons
         path = os.path.join(os.path.dirname(__file__), "otdb", "otypes", "otypes06.b08")
+        if not os.path.exists(path):
+            pytest.skip(f"{path} not found — run tests/otdb/download.py first")
         for sl in read_order_types(path, n=6):
             bl = sl.to_big_lambda()
             cr = count_crossings(sl)

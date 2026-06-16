@@ -99,8 +99,11 @@ class TestTriangulationsModelCount:
 
 class TestTriangulationsOTDB:
     def _load_otdb(self, n):
+        from pathlib import Path
         from pyotlib2.io.readers import read_order_types
         path = f"tests/otdb/otypes/otypes{n:02d}.b08"
+        if not Path(path).exists():
+            pytest.skip(f"{path} not found — run tests/otdb/download.py first")
         return list(read_order_types(path, fmt="pb08", n=n))
 
     def test_otdb_n6_sum(self):

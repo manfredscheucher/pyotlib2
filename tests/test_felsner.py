@@ -7,6 +7,8 @@ can represent the same order type.
 Bijection: all unique OTs for n produce distinct replace matrices.
 """
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -23,7 +25,10 @@ def to_natural(ot):
 
 
 def unique_ots(n, fname):
-    ots = list(read_order_types(f"tests/otdb/otypes/{fname}", n=n))
+    path = f"tests/otdb/otypes/{fname}"
+    if not Path(path).exists():
+        pytest.skip(f"{path} not found — run tests/otdb/download.py first")
+    ots = list(read_order_types(path, n=n))
     return list(unify(ots))
 
 
