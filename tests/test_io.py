@@ -280,6 +280,61 @@ class TestJsonFormat:
 
 
 # ---------------------------------------------------------------------------
+# Comment headers on text formats
+# ---------------------------------------------------------------------------
+
+class TestCommentHeader:
+    def _write_read(self, ots, fmt, header, n):
+        with tempfile.NamedTemporaryFile(suffix=f".{fmt}", delete=False) as f:
+            path = Path(f.name)
+        try:
+            write_order_types(ots, path, fmt=fmt, header=header)
+            text = path.read_text()
+            back = list(read_order_types(path, fmt=fmt, n=n))
+            return text, back
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_blt_header_roundtrip(self):
+        sl = to_natural(make_sl(SAMPLE_POINTS_5))
+        text, back = self._write_read([sl], "blt", "n: 5\nsign: B=+ R=-", n=5)
+        assert text.startswith("# n: 5\n# sign: B=+ R=-\n")
+        assert sl.compare(back[0]) == 0
+
+    def test_slt_header_list_of_lines(self):
+        sl = make_sl(SAMPLE_POINTS_5)
+        text, back = self._write_read([sl], "slt", ["provenance", "# kept"], n=5)
+        # first line prefixed, second left as-is (already starts with '#')
+        assert text.startswith("# provenance\n# kept\n")
+        assert sl.compare(back[0]) == 0
+
+    def test_fmt_header_roundtrip(self):
+        sl = to_natural(make_sl(SAMPLE_POINTS_5))
+        text, back = self._write_read([sl], "fmt", "felsner", n=5)
+        assert text.startswith("# felsner\n")
+        assert sl.compare(back[0]) == 0
+
+    def test_asc_header_roundtrip(self):
+        pts = SAMPLE_POINTS_5
+        sl = make_sl(pts)
+        sl.realization = list(pts)
+        text, back = self._write_read([sl], "asc", "points", n=len(pts))
+        assert text.startswith("# points\n")
+        assert back[0].n == len(pts)
+
+    def test_header_rejected_for_binary(self):
+        sl = to_natural(make_sl(SAMPLE_POINTS_5))
+        for fmt in ["blb", "slb08", "json", "fmb"]:
+            with tempfile.NamedTemporaryFile(suffix=f".{fmt}", delete=False) as f:
+                path = Path(f.name)
+            try:
+                with pytest.raises(ValueError):
+                    write_order_types([sl], path, fmt=fmt, header="nope")
+            finally:
+                path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # Bit-packing helpers
 # ---------------------------------------------------------------------------
 

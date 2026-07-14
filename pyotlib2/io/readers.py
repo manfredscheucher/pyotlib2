@@ -512,9 +512,17 @@ def _read_point_text_asc(
     with open(filepath, "r") as f:
         lines = f.readlines()
     i = 0
-    while i < len(lines):
-        while i < len(lines) and lines[i].strip().startswith("#"):
+
+    def _skip() -> None:
+        # Skip blank lines and '#' comments, matching the other text readers.
+        nonlocal i
+        while i < len(lines) and (
+            not lines[i].strip() or lines[i].strip().startswith("#")
+        ):
             i += 1
+
+    while i < len(lines):
+        _skip()
         if i >= len(lines):
             break
         cur_n = int(lines[i].strip())
@@ -523,8 +531,7 @@ def _read_point_text_asc(
             assert cur_n == n
         coords = []
         for _ in range(cur_n):
-            while lines[i].strip().startswith("#"):
-                i += 1
+            _skip()
             x, y = map(int, lines[i].split())
             coords.append((x, y))
             i += 1

@@ -21,10 +21,16 @@ from pyotlib2.core.utils import binomial
 # Public API
 # ---------------------------------------------------------------------------
 
+# Text formats whose readers skip lines starting with '#'.  Only these
+# support an optional comment header.
+_COMMENTABLE = frozenset({"slt", "blt", "fmt", "asc", "psz"})
+
+
 def write_order_types(
     ots: Iterable[SmallLambda],
     filepath: str | Path,
     fmt: Optional[str] = None,
+    header: Optional[str | Iterable[str]] = None,
 ) -> int:
     """Write order types to *filepath*.  Returns the number of OTs written.
 
@@ -37,6 +43,14 @@ def write_order_types(
     fmt:
         Format string (see ``pyotlib2.io.readers`` module docstring).
         If ``None``, inferred from the file extension.
+    header:
+        Optional comment header written at the top of the file.  A string
+        (possibly multi-line) or an iterable of lines; each line is prefixed
+        with ``# `` if not already starting with ``#``.  The matching readers
+        skip these lines, so the header is inert on read.  Only supported for
+        text formats that honour ``#`` comments (``slt``, ``blt``, ``fmt``,
+        ``asc``, ``psz``); requesting a header for any other format raises
+        ``ValueError``.
     """
     filepath = Path(filepath)
     if fmt is None:
@@ -50,25 +64,31 @@ def write_order_types(
     if fmt == "txt":
         fmt = "slt"
 
+    if header is not None and fmt not in _COMMENTABLE:
+        raise ValueError(
+            f"header is only supported for comment-aware text formats "
+            f"({', '.join(sorted(_COMMENTABLE))}), not {fmt!r}."
+        )
+
     dispatch = {
-        "slt":    lambda: _write_small_lambda_text(ots, filepath),
+        "slt":    lambda: _write_small_lambda_text(ots, filepath, header),
         "slb04":  lambda: _write_slb(ots, filepath, bits=4, compressed=False),
         "slb08":  lambda: _write_slb(ots, filepath, bits=8, compressed=False),
         "slb16":  lambda: _write_slb(ots, filepath, bits=16, compressed=False),
         "slbc04": lambda: _write_slb(ots, filepath, bits=4, compressed=True),
         "slbc08": lambda: _write_slb(ots, filepath, bits=8, compressed=True),
         "slbc16": lambda: _write_slb(ots, filepath, bits=16, compressed=True),
-        "blt":    lambda: _write_big_lambda_text(ots, filepath),
+        "blt":    lambda: _write_big_lambda_text(ots, filepath, header),
         "blb":    lambda: _write_blb(ots, filepath, compressed=False),
         "blbc":   lambda: _write_blb(ots, filepath, compressed=True),
-        "fmt":    lambda: _write_felsner_text(ots, filepath),
+        "fmt":    lambda: _write_felsner_text(ots, filepath, header),
         "fmb":    lambda: _write_felsner_binary(ots, filepath),
         "pb04":   lambda: _write_point_binary(ots, filepath, bits=4),
         "pb08":   lambda: _write_point_binary(ots, filepath, bits=8),
         "pb16":   lambda: _write_point_binary(ots, filepath, bits=16),
         "pb32":   lambda: _write_point_binary(ots, filepath, bits=32),
-        "asc":    lambda: _write_point_text_asc(ots, filepath),
-        "psz":    lambda: _write_point_text_asc(ots, filepath),
+        "asc":    lambda: _write_point_text_asc(ots, filepath, header),
+        "psz":    lambda: _write_point_text_asc(ots, filepath, header),
         "json":   lambda: _write_point_text_json(ots, filepath),
     }
     if fmt not in dispatch:
@@ -77,6 +97,17 @@ def write_order_types(
             + ", ".join(sorted(dispatch))
         )
     return dispatch[fmt]()
+
+
+def _write_header(f, header: Optional[str | Iterable[str]]) -> None:
+    """Write a '#'-prefixed comment header to open text file *f* (if any)."""
+    if header is None:
+        return
+    lines = header.splitlines() if isinstance(header, str) else list(header)
+    for line in lines:
+        line = line.rstrip("\n")
+        f.write(line if line.startswith("#") else f"# {line}")
+        f.write("\n")
 
 
 # ---------------------------------------------------------------------------
@@ -109,9 +140,13 @@ def _assert_natural(sl: SmallLambda, fmt: str) -> None:
 # SmallLambda text
 # ---------------------------------------------------------------------------
 
-def _write_small_lambda_text(ots: Iterable[SmallLambda], filepath: Path) -> int:
+def _write_small_lambda_text(
+    ots: Iterable[SmallLambda], filepath: Path,
+    header: Optional[str | Iterable[str]] = None,
+) -> int:
     cnt = 0
     with open(filepath, "w") as f:
+        _write_header(f, header)
         for ot in ots:
             f.write(ot.to_string())
             f.write("\n")
@@ -175,9 +210,13 @@ def _encode_slb(n: int, L: np.ndarray, bits: int, compressed: bool) -> bytes:
 # BigLambda text
 # ---------------------------------------------------------------------------
 
-def _write_big_lambda_text(ots: Iterable[SmallLambda], filepath: Path) -> int:
+def _write_big_lambda_text(
+    ots: Iterable[SmallLambda], filepath: Path,
+    header: Optional[str | Iterable[str]] = None,
+) -> int:
     cnt = 0
     with open(filepath, "w") as f:
+        _write_header(f, header)
         for ot in ots:
             f.write(ot.to_big_lambda().to_string() + "\n")
             cnt += 1
@@ -215,10 +254,14 @@ def _write_blb(
 # FelsnerMatrix text / binary
 # ---------------------------------------------------------------------------
 
-def _write_felsner_text(ots: Iterable[SmallLambda], filepath: Path) -> int:
+def _write_felsner_text(
+    ots: Iterable[SmallLambda], filepath: Path,
+    header: Optional[str | Iterable[str]] = None,
+) -> int:
     from pyotlib2.core.felsner_matrix import FelsnerMatrix
     cnt = 0
     with open(filepath, "w") as f:
+        _write_header(f, header)
         for ot in ots:
             fm = FelsnerMatrix.from_small_lambda(ot)
             f.write(fm.to_fmt_string())
@@ -279,9 +322,13 @@ def _write_point_binary(
 # ASCII point set text
 # ---------------------------------------------------------------------------
 
-def _write_point_text_asc(ots: Iterable[SmallLambda], filepath: Path) -> int:
+def _write_point_text_asc(
+    ots: Iterable[SmallLambda], filepath: Path,
+    header: Optional[str | Iterable[str]] = None,
+) -> int:
     cnt = 0
     with open(filepath, "w") as f:
+        _write_header(f, header)
         for ot in ots:
             assert ot.realization is not None
             f.write(f"{ot.n}\n")
