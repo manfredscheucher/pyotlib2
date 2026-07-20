@@ -40,6 +40,14 @@ def test_write_script_cold_start(tmp_path):
     # default (non-logsum) uses the squared hinge q[...]^2
     assert "]^2" in text
     assert "Export[" in text
+    # the found/not-found signal: fmin (the minimised penalty) is captured,
+    # written to a sibling .objective file, and a REALIZED/NOT REALIZED verdict
+    # plus the coordinates are printed to stdout.
+    assert "fmin = First[result];" in text
+    assert ".objective" in text
+    assert "REALIZED" in text
+    assert "NOT REALIZED" in text
+    assert 'Print["coords = ", sol];' in text
 
 
 def test_write_script_precision_and_logsum(tmp_path):

@@ -154,8 +154,22 @@ class MathematicaRealizationTester(RealizationTester):
             f"vars = {{{vars_list}}};",
             f"result = NMinimize[{{{objective}, {{{vars_list}}}}}, {{{vars_list}}}"
             + (", " + ", ".join(opts) if opts else "") + "];",
+            # fmin is the minimised penalty; it is 0 (to solver tolerance) iff a
+            # realization was found -- this is the found/not-found indicator.
+            "fmin = First[result];",
             "sol = vars /. Last[result];",
+            # Machine-readable output file: the coordinates, one point per line.
+            # (Kept as the primary .out so the in-process solver can read it back.)
             f'Export["{out_escaped}", sol, "Table"];',
+            # A sibling .objective file holds fmin alone, so a script can decide
+            # found/not-found without re-evaluating the objective.
+            f'Export["{out_escaped}.objective", {{fmin}}, "Table"];',
+            # Human-readable verdict on stdout when run with wolframscript -file.
+            'Print["objective = ", fmin];',
+            'If[fmin < 10^-6, Print["REALIZED"], '
+            'Print["NOT REALIZED (local minimum / precision -- '
+            'not a proof of non-realizability)"]];',
+            'Print["coords = ", sol];',
         ]
         with open(script_path, "w") as f:
             f.write("\n".join(lines) + "\n")
