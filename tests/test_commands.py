@@ -366,3 +366,54 @@ class TestCountProperty:
         from pyotlib2.cli.commands import _count_property
         sl = _one_interior()
         assert _count_property(sl, "onion-layers") == 2
+
+
+# ---------------------------------------------------------------------------
+# export helpers: LP / Mathematica (Feature 3)
+# ---------------------------------------------------------------------------
+
+class TestExportHelpers:
+    def test_export_lp_single_and_parseable(self, tmp_path):
+        """The exported LP starts with the objective sense (glpsol-parseable)."""
+        from pyotlib2.cli.commands import _export_lp
+        sl = _one_interior(6)
+        out = tmp_path / "gp.lp"
+        _export_lp([sl], str(out), 6)
+        text = out.read_text()
+        # CPLEX-LP: must begin with Maximize (no leading comment) and end with End
+        assert text.lstrip().startswith("Maximize")
+        assert "myEps" in text
+        assert text.rstrip().endswith("End")
+
+    def test_export_lp_multiple_hashes_filenames(self, tmp_path):
+        """Multiple OTs get distinct hash-tagged filenames."""
+        from pyotlib2.cli.commands import _export_lp
+        a = _one_interior(6)
+        b = _convex_abstract(6)
+        base = tmp_path / "gp.lp"
+        _export_lp([a, b], str(base), 6)
+        files = sorted(p.name for p in tmp_path.glob("gp_*.lp"))
+        assert len(files) == 2
+
+    def test_export_mathematica_script(self, tmp_path):
+        """The Mathematica export works even without wolframscript on PATH."""
+        from pyotlib2.cli.commands import _export_mathematica
+        sl = _one_interior(6)
+        out = tmp_path / "qcp.m"
+        _export_mathematica([sl], str(out), 6)
+        text = out.read_text()
+        assert "NMinimize[" in text
+        assert "Export[" in text
+        # default: no WorkingPrecision, squared hinge (not Log)
+        assert "WorkingPrecision" not in text
+        assert "Log[" not in text
+
+    def test_export_mathematica_honors_precision_and_logsum(self, tmp_path):
+        """--precision and --logsum flow into the exported Mathematica script."""
+        from pyotlib2.cli.commands import _export_mathematica
+        sl = _one_interior(6)
+        out = tmp_path / "qcp.m"
+        _export_mathematica([sl], str(out), 6, precision=200, logsum=True)
+        text = out.read_text()
+        assert "WorkingPrecision -> 200" in text
+        assert "Log[" in text
