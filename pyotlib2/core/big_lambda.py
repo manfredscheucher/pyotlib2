@@ -95,6 +95,93 @@ class BigLambda:
 
         return True
 
+    def is_chirotope(self, print_violation: bool = False) -> bool:
+        """Validate the rank-3 chirotope axioms (3-term Grassmann-Plücker).
+
+        Implements Theorem 3 of Scheucher, "A SAT attack on higher dimensional
+        Erdős–Szekeres numbers" (arXiv:2105.08406), for rank ``r = 3``.  A map
+        ``χ`` on ordered triples is a non-degenerate rank-3 chirotope iff:
+
+        (i)   ``χ(a1,a2,a3) ≠ 0`` for every three distinct indices;
+        (ii)  ``χ`` is alternating: swapping two arguments flips the sign
+              (``sgn(σ)`` under any permutation σ);
+        (iii) for all indices ``a1,a2,a3,b1,b2``::
+
+                  if   χ(b1,a2,a3)·χ(a1,b2,a3) ≥ 0
+                  and  χ(b2,a2,a3)·χ(b1,a1,a3) ≥ 0
+                  then χ(a1,a2,a3)·χ(b1,b2,a3) ≥ 0
+
+        A violation of (iii) is thus: both premises ``≥ 0`` while the conclusion
+        product is ``< 0``.  This is labelling-independent.
+        """
+        o = self.o
+        n = self.n
+
+        # (i) + (ii): non-degenerate and alternating.
+        for i, j, k in combinations(range(n), 3):
+            v = int(o[i, j, k])
+            if v == 0:
+                if print_violation:
+                    print(f"axiom (i) violated: zero triple {i},{j},{k}")
+                return False
+            if not (v == -o[i, k, j] == -o[j, i, k] == o[j, k, i]
+                    == o[k, i, j] == -o[k, j, i]):
+                if print_violation:
+                    print(f"axiom (ii) violated: non-alternating triple {i},{j},{k}")
+                return False
+
+        # (iii): 3-term Grassmann-Plücker relation.  All six factors share the
+        # common last index a3; b1,b2 are exchanged against a1,a2.
+        rng = range(n)
+        for a3 in rng:
+            for a1, a2, b1, b2 in permutations(rng, 4):
+                if a1 == a3 or a2 == a3 or b1 == a3 or b2 == a3:
+                    continue
+                prem1 = int(o[b1, a2, a3]) * int(o[a1, b2, a3])
+                prem2 = int(o[b2, a2, a3]) * int(o[b1, a1, a3])
+                if prem1 >= 0 and prem2 >= 0:
+                    concl = int(o[a1, a2, a3]) * int(o[b1, b2, a3])
+                    if concl < 0:
+                        if print_violation:
+                            print(f"axiom (iii) violated at a1={a1},a2={a2},"
+                                  f"a3={a3},b1={b1},b2={b2}")
+                        return False
+        return True
+
+    def is_signotope(self, print_violation: bool = False) -> bool:
+        """Validate the signotope axiom on the sorted-triple orientations.
+
+        A chirotope on a *linearly ordered* ground set is a signotope iff, for
+        every 4-tuple a<b<c<d, the sign sequence of the four sorted triples
+
+            o(a,b,c), o(a,b,d), o(a,c,d), o(b,c,d)
+
+        changes sign **at most once** (reading left to right, ignoring zeros).
+        This is the abstract-order-type condition that every realizable point
+        set satisfies and that a valid ``.blt`` / ``.color`` file must obey.
+
+        Only the sorted triples (a<b<c) carry independent information, so this
+        test never inspects the antisymmetric copies — it validates exactly the
+        data given in those file formats.
+        """
+        o = self.o
+        for a, b, c, d in combinations(range(self.n), 4):
+            signs = [int(o[a, b, c]), int(o[a, b, d]),
+                     int(o[a, c, d]), int(o[b, c, d])]
+            nonzero = [s for s in signs if s != 0]
+            if 0 in signs:
+                # a zero orientation means collinear points: not a valid OT
+                if print_violation:
+                    print(f"collinear triple within 4-tuple {a},{b},{c},{d}: {signs}")
+                return False
+            changes = sum(1 for x, y in zip(nonzero, nonzero[1:]) if x != y)
+            if changes > 1:
+                if print_violation:
+                    print(f"signotope violation at {a},{b},{c},{d}: "
+                          f"signs={signs} has {changes} sign changes")
+                return False
+        return True
+
     # ------------------------------------------------------------------
     # Conversions
     # ------------------------------------------------------------------

@@ -36,6 +36,12 @@ class SmallLambda:
         self.l = l  # np.int32, shape (n, n), or None (lazy)
         self.realization = realization
         self.coloring = coloring
+        # Warm start for realization: a point set realizing the (n-1)-point
+        # sub-order-type on the first n-1 points.  Consumed by continuous-
+        # optimizer testers (scipy, octave) as an initial guess so only the
+        # last point still violates the constraints.  Not part of the abstract
+        # order type; set by the etherealization driver.
+        self.subrealization: Optional[list] = None
 
     # ------------------------------------------------------------------
     # Lazy matrix access
@@ -100,7 +106,59 @@ class SmallLambda:
     # Identity / serialisation
     # ------------------------------------------------------------------
 
+    # Three levels of identity, from finest to coarsest equivalence:
+    #   SL-hash : this exact rank matrix (labeling-dependent)
+    #   OT-hash : the order type, i.e. lex-min over all relabelings + mirror
+    #   PC-hash : the projective class (lex-min over the flip graph)
+    # Each is the SHA-256 of the corresponding canonical ``to_string()``.
+
+    @staticmethod
+    def _sha(text: str) -> str:
+        return hashlib.sha256(text.encode()).hexdigest()
+
+    def sl_hash(self) -> str:
+        """SHA-256 of *this* SmallLambda (rank matrix ``to_string()``).
+
+        Labeling-DEPENDENT: relabeling the points of the underlying point set
+        yields a different SmallLambda and hence a different SL-hash, even though
+        the order type is unchanged.  Use to identify a concrete labeled
+        rank matrix.
+        """
+        return self._sha(self.to_string())
+
+    def ot_hash(self) -> str:
+        """SHA-256 of the ORDER TYPE (lex-min over all relabelings + mirror).
+
+        Labeling-INDEPENDENT: every relabeling/mirror of the same order type
+        maps to the same lex-min representative, so the OT-hash identifies the
+        abstract order type itself.  This is the identifier to use when the
+        labeling should not matter.
+        """
+        return self._sha(self.get_lex_min().to_string())
+
+    def pc_hash(self) -> str:
+        """SHA-256 of the PROJECTIVE CLASS representative.
+
+        Identifies the order type up to projective equivalence (reflections of
+        convex-hull points).  Two order types with the same PC-hash lie in the
+        same projective class.  More expensive (enumerates the flip graph).
+        """
+        from pyotlib2.algorithms.projective_class import ProjectiveClass
+        return self._sha(ProjectiveClass(self).representer.to_string())
+
+    # 6 hex digits is plenty for a human to eyeball "same vs. different" — the
+    # SL matrix itself is visually hard to compare, so a short tag is the point.
+    def short_sl_hash(self, length: int = 6) -> str:
+        return self.sl_hash()[:length]
+
+    def short_ot_hash(self, length: int = 6) -> str:
+        return self.ot_hash()[:length]
+
+    def short_pc_hash(self, length: int = 6) -> str:
+        return self.pc_hash()[:length]
+
     def get_id(self) -> str:
+        # Deprecated: kept for backward compatibility; prefer sl_hash() (SHA-256).
         return hashlib.md5(self.to_string().encode()).hexdigest()
 
     def to_string(self) -> str:
@@ -318,6 +376,15 @@ class SmallLambda:
     # ------------------------------------------------------------------
     # Sub-order types
     # ------------------------------------------------------------------
+
+    def select_points(self, indices: list) -> "SmallLambda":
+        """Return the sub-order-type induced by the given point indices.
+
+        Keeps the given labelling (no lex-min), which is what the
+        etherealization driver needs when it grows a point set one point at a
+        time.  Carries the realization along if present.
+        """
+        return self.to_big_lambda().select_points(indices)
 
     def reduce(
         self,

@@ -26,6 +26,13 @@ def add_input_args(parser) -> None:
         default=None,
         help="Number of points per order type (required for binary formats).",
     )
+    parser.add_argument(
+        "--hash-length",
+        dest="hash_length",
+        type=int,
+        default=6,
+        help="Number of hex digits shown for order-type hashes (default: 6).",
+    )
 
 
 def add_output_args(parser, default_suffix: str = ".out") -> None:
@@ -61,12 +68,13 @@ def resolve_output(args, suffix: str = ".out") -> tuple:
 def progress_iter(it: Iterator, label: str = "processing") -> Iterator:
     """Wrap an iterator with simple stderr progress output."""
     from datetime import datetime
+    from pyotlib2.logging import log
     start = datetime.now()
     show = 1
     for cnt, item in enumerate(it):
         if cnt == show:
             elapsed = datetime.now() - start
-            print(f"[{datetime.now()}] {label}: {cnt} ({elapsed})", file=sys.stderr)
+            log(f"{label}: {cnt} ({elapsed})", stream=sys.stderr)
             show = min(show * 2, show + 1000) if show < 1000 else show + 1000
         yield item
-    print(f"[{datetime.now()}] {label}: done", file=sys.stderr)
+    log(f"{label}: done", stream=sys.stderr)

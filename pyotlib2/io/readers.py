@@ -114,8 +114,8 @@ def read_order_types(
     elif fmt == "b16":
         fmt = "pb16"
 
-    # legacy text aliases
-    if fmt == "txt":
+    # legacy text aliases (SmallLambda text)
+    if fmt in ("txt", "lt"):
         fmt = "slt"
 
     if n is None and fmt in (
@@ -530,12 +530,19 @@ def _read_point_text_asc(
         if n is not None:
             assert cur_n == n
         coords = []
-        for _ in range(cur_n):
+        coloring: Optional[dict] = None
+        for idx in range(cur_n):
             _skip()
-            x, y = map(int, lines[i].split())
+            parts = lines[i].split()
+            # "x y" or, for bicolored point sets (PoSeZo c2), "x y COLOR".
+            x, y = int(parts[0]), int(parts[1])
             coords.append((x, y))
+            if len(parts) >= 3:
+                if coloring is None:
+                    coloring = {}
+                coloring[idx] = parts[2]
             i += 1
-        yield PointSet(cur_n, coords).to_small_lambda()
+        yield PointSet(cur_n, coords, coloring=coloring).to_small_lambda()
 
 
 # ---------------------------------------------------------------------------

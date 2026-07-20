@@ -29,7 +29,17 @@ class ProjectiveClass:
 
     def __init__(self, ot: SmallLambda, calc_lex_min: bool = True):
         self._start = ot
-        self._ot_dict: dict[str, tuple] = {}  # str → (SmallLambda, flip_vec, labeling)
+        # str → (SmallLambda, flip_vec, labeling, mirror) recording, for each
+        # class member ``m`` reachable from the lex-min ``start``, a transform::
+        #
+        #     m == start.from_flips(flip_vec).relabeled(labeling)[.mirrored() if mirror]
+        #
+        # The ``mirror`` bit is the CUMULATIVE mirror parity: each BFS step's
+        # ``get_lex_min`` may itself mirror to reach the canonical form, and that
+        # parity has to be carried along or the recorded transform is off by a
+        # global orientation reversal.  ``pc_tester`` inverts this exact chain to
+        # transport a realization of ``m`` back onto ``start`` (and thence ``ot``).
+        self._ot_dict: dict[str, tuple] = {}
         self._enumerate(only_find_better=(not calc_lex_min))
 
     def _enumerate(self, only_find_better: bool = False) -> None:
@@ -38,28 +48,29 @@ class ProjectiveClass:
         start = self._start.get_lex_min()
         start_key = start.to_string()
         queue: deque = deque()
-        queue.append((start, [0] * start.n, list(range(start.n))))
-        self._ot_dict[start_key] = (start, [0] * start.n, list(range(start.n)))
+        queue.append((start, [0] * start.n, list(range(start.n)), False))
+        self._ot_dict[start_key] = (start, [0] * start.n, list(range(start.n)), False)
 
         while queue:
-            ot, flip_vec, labeling = queue.popleft()
+            ot, flip_vec, labeling, mirror = queue.popleft()
             for p in ot.get_extremal_points():
                 flipped = ot.flip_point(p)
-                flipped_lm, lab2, _ = flipped.get_lex_min(return_labeling=True)
+                flipped_lm, lab2, mir2 = flipped.get_lex_min(return_labeling=True)
                 key = flipped_lm.to_string()
                 if key not in self._ot_dict:
                     new_flip = list(flip_vec)
                     new_flip[labeling[p]] ^= 1
                     new_labeling = [labeling[lab2[i]] for i in range(ot.n)]
-                    self._ot_dict[key] = (flipped_lm, new_flip, new_labeling)
-                    queue.append((flipped_lm, new_flip, new_labeling))
+                    new_mirror = mirror ^ mir2
+                    self._ot_dict[key] = (flipped_lm, new_flip, new_labeling, new_mirror)
+                    queue.append((flipped_lm, new_flip, new_labeling, new_mirror))
                     if only_find_better and flipped_lm.compare(self._start) < 0:
                         return
 
     @cached_property
     def representer(self) -> SmallLambda:
         """Lexicographically minimal OT in this projective class (cached)."""
-        return min(ot for ot, _, _ in self._ot_dict.values())
+        return min(ot for ot, _, _, _ in self._ot_dict.values())
 
     def get_representer(self) -> SmallLambda:
         return self.representer
@@ -68,7 +79,7 @@ class ProjectiveClass:
         return self._start.compare(self.representer) == 0
 
     def all_ots(self) -> list:
-        return [ot for ot, _, _ in self._ot_dict.values()]
+        return [ot for ot, _, _, _ in self._ot_dict.values()]
 
     def size(self) -> int:
         return len(self._ot_dict)

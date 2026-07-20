@@ -27,6 +27,7 @@ Two conceptually different optimization modes
 
 from __future__ import annotations
 import argparse
+import os
 import sys
 from typing import Iterable, Iterator, Optional
 
@@ -343,7 +344,7 @@ def _register_find_subconf(sub) -> None:
 def _cmd_find_subconf(args) -> None:
     refs = list(read_order_types(args.ref, fmt=args.ref_fmt, n=args.ref_n))
     for ot, matched in find_sub_ot(open_input(args), refs, args.k):
-        print(ot.to_string().strip(), "->", matched)
+        print(f"n={ot.n} slhash={ot.short_sl_hash(args.hash_length)} -> {matched}")
 
 
 # ---------------------------------------------------------------------------
@@ -615,8 +616,14 @@ def realize(
     grid_tries: int = 20,
     use_pc: bool = False,
     max_pc_trials: int = 0,
+    on_large_n=None,
+    solver_kwargs: Optional[dict] = None,
 ) -> Iterator[tuple]:
-    """Test realizability of abstract order types.
+    """Test realizability of abstract order types (direct QCP, no etherealization).
+
+    This runs the chosen solver DIRECTLY on each order type.  It is intended for
+    small n; for larger / harder order types use ``smart_realize`` (incremental
+    etherealization).  See :func:`smart_realize`.
 
     Yields (ot, result) where result is True/False/None (unknown).
 
@@ -626,22 +633,31 @@ def realize(
 
     use_pc: if True, search through the projective class of each OT and test
             each member until one is realized or all (up to max_pc_trials) tried.
+
+    on_large_n: optional callback ``(n) -> bool`` invoked before realizing an OT;
+            if it returns False the OT is skipped (yielded as unknown).  Used by
+            the CLI to warn once about direct realization at large n.
     """
     from pyotlib2.realization.base import Undecided
+    from pyotlib2.realization import make_tester
 
-    if method == "gp":
-        from pyotlib2.realization.gp_tester import GPRealizationTester
-        tester = GPRealizationTester()
+    # Any registered solver name works (grid/scipy/z3/gp and the per-method
+    # families scipy.*, nlopt.*, octave.*, sage.*).  Grid and scipy take extra
+    # tuning params; everything else uses registry defaults.
+    # Extra solver knobs (e.g. precision=, logsum=) forwarded to make_tester;
+    # drop any a given tester does not accept (not every solver has --precision).
+    extra = _accepted_solver_kwargs(method, dict(solver_kwargs or {}))
+    if method == "grid":
+        tester = make_tester("grid", gridsize=gridsize, max_tries=grid_tries)
     elif method == "scipy":
-        from pyotlib2.realization.scipy_tester import ScipyRealizationTester
-        tester = ScipyRealizationTester(trials=trials)
-    elif method == "grid":
-        from pyotlib2.realization.grid_search import GridSearchTester
-        tester = GridSearchTester(gridsize=gridsize, max_tries=grid_tries)
+        tester = make_tester("scipy", trials=trials, **extra)
     else:
-        raise ValueError(f"Unknown method: {method!r}")
+        tester = make_tester(method, **extra)
 
     for ot in ots:
+        if on_large_n is not None and not on_large_n(ot.n):
+            yield ot, None  # user declined direct realization at large n
+            continue
         if not use_pc:
             try:
                 yield ot, tester.is_realizable(ot)
@@ -686,10 +702,17 @@ def _register_realize(sub) -> None:
         ),
     )
     add_input_args(p)
-    p.add_argument("--method", default="grid", choices=["grid", "scipy", "gp"],
-                   help="Realization method (default: grid)")
+    p.add_argument("--method", default="grid",
+                   help="Realization solver (default: grid).  " + _solver_help())
     p.add_argument("--trials", type=int, default=20,
                    help="Number of optimization trials (scipy only)")
+    p.add_argument("--precision", type=int, default=0,
+                   help="Working-precision mantissa bits for arbitrary-precision "
+                        "solvers (mpmath, mathematica); 0 = the solver default. "
+                        "Ignored by solvers without a precision knob.")
+    p.add_argument("--logsum", action="store_true", default=False,
+                   help="Use the log-sum penalty sum log(1+viol) instead of the "
+                        "squared hinge (continuous solvers only).")
     p.add_argument("--gridsize", type=int, default=256,
                    help="Grid side length, power of 2 (grid method, default: 256)")
     p.add_argument("--grid-tries", type=int, default=20,
@@ -698,10 +721,125 @@ def _register_realize(sub) -> None:
                    help="Search through the projective class of each OT")
     p.add_argument("--max-pc-trials", type=int, default=0,
                    help="Max PC members to try per OT (0 = all, only with --pc)")
+    p.add_argument("--export-lp", metavar="FILE", default=None,
+                   help="With --method gp: write only the Grassmann-Plücker LP "
+                        "to FILE (runnable with 'glpsol --lp FILE' or Gurobi) "
+                        "and do NOT solve.  A per-OT index/hash is appended for "
+                        "multiple inputs.")
+    p.add_argument("--export-mathematica", metavar="FILE", default=None,
+                   help="With --method mathematica: write only the Mathematica "
+                        "script (cold start) to FILE (runnable with "
+                        "'wolframscript -file FILE') and do NOT solve.")
     p.set_defaults(func=_cmd_realize)
 
 
+# n above which directly solving the realization QCP is discouraged: as n grows
+# most order types are NOT realizable and realizations may need huge coordinates
+# (see arXiv:2007.15334), so smart-realize / non-realizability tests are wiser.
+_DIRECT_REALIZE_WARN_N = 15
+_direct_realize_warned = [False]
+
+
+def _warn_large_n_direct_realize(n: int) -> bool:
+    """Warn once (with a Y/N prompt) when directly realizing a large-n OT.
+
+    Returns True to proceed, False to abort.  Only prompts once per process and
+    only on an interactive terminal; in non-interactive use it proceeds silently.
+    """
+    if n <= _DIRECT_REALIZE_WARN_N or _direct_realize_warned[0]:
+        return True
+    _direct_realize_warned[0] = True
+    msg = (
+        f"warning: direct realization requested for n={n} (> {_DIRECT_REALIZE_WARN_N}).\n"
+        "  As n grows most order types are non-realizable and realizations may\n"
+        "  need very large coordinates (arXiv:2007.15334).  Blindly solving the\n"
+        "  QCP is unwise here — prefer 'smart-realize' (incremental, n>10) and\n"
+        "  keep non-realizability in mind (methods 'gp' / z3 can certify it)."
+    )
+    print(msg, file=sys.stderr)
+    if not sys.stdin.isatty():
+        return True  # non-interactive (scripts, pipes): proceed without prompting
+    try:
+        answer = input("  continue with direct realization anyway? [y/N] ").strip().lower()
+    except EOFError:
+        return False
+    return answer in ("y", "yes")
+
+
+def _export_path(base: str, ot: SmallLambda, count: int, hash_length: int) -> str:
+    """Per-OT export path: ``base`` for a single OT, else ``base`` + the OT hash.
+
+    The order-type's short hash is appended before the suffix so multiple input
+    OTs each get a distinct, content-identifying file.
+    """
+    from pathlib import Path
+    if count == 1:
+        return base
+    p = Path(base)
+    return str(p.with_name(f"{p.stem}_{ot.short_sl_hash(hash_length)}{p.suffix}"))
+
+
+def _export_lp(ots: list, base: str, hash_length: int) -> None:
+    """Write the Grassmann-Plücker LP of each OT to a file (do not solve)."""
+    from pyotlib2.realization.gp_tester import GPRealizationTester
+    # Build the tester WITHOUT running __init__ (which requires glpsol on PATH);
+    # we only need its pure formatter _write_lp, not the binary.
+    exporter = GPRealizationTester.__new__(GPRealizationTester)
+    for ot in ots:
+        path = _export_path(base, ot, len(ots), hash_length)
+        exporter._write_lp(ot, path)
+        print(f"exported LP: n={ot.n} slhash={ot.short_sl_hash(hash_length)} -> {path}")
+
+
+def _export_mathematica(ots: list, base: str, hash_length: int,
+                        precision: int = 0, logsum: bool = False) -> None:
+    """Write the Mathematica NMinimize script of each OT to a file (do not solve).
+
+    ``precision`` (>0) sets the exported ``WorkingPrecision``; ``logsum`` switches
+    the objective to the log-sum penalty — so the exported script matches what the
+    solver would run with the same ``--precision`` / ``--logsum`` flags.
+    """
+    from pyotlib2.realization.mathematica_tester import MathematicaRealizationTester
+    from pyotlib2.realization.qcp import RealizationQCP
+    # Build the tester WITHOUT running __init__ (which requires wolframscript on
+    # PATH); we only need its pure formatter write_script, not the binary.
+    exporter = MathematicaRealizationTester.__new__(MathematicaRealizationTester)
+    exporter.precision = int(precision) if precision else 0
+    exporter.logsum = bool(logsum)
+    exporter.method = "NelderMead"
+    for ot in ots:
+        path = _export_path(base, ot, len(ots), hash_length)
+        qcp = RealizationQCP(ot, logsum=exporter.logsum)
+        exporter.write_script(path, path + ".out", qcp, z0=None)
+        print(f"exported Mathematica script: n={ot.n} "
+              f"slhash={ot.short_sl_hash(hash_length)} -> {path}")
+
+
 def _cmd_realize(args) -> None:
+    export_lp = getattr(args, "export_lp", None)
+    export_math = getattr(args, "export_mathematica", None)
+    if export_lp or export_math:
+        ots = list(open_input(args))
+        if export_lp:
+            if args.method != "gp":
+                print("warning: --export-lp is for --method gp; exporting the "
+                      "Grassmann-Plücker LP anyway.", file=sys.stderr)
+            _export_lp(ots, export_lp, args.hash_length)
+        if export_math:
+            if args.method != "mathematica":
+                print("warning: --export-mathematica is for --method mathematica; "
+                      "exporting the script anyway.", file=sys.stderr)
+            _export_mathematica(ots, export_math, args.hash_length,
+                                precision=getattr(args, "precision", 0),
+                                logsum=getattr(args, "logsum", False))
+        return
+
+    solver_kwargs = {}
+    if getattr(args, "precision", 0):
+        solver_kwargs["precision"] = args.precision
+    if getattr(args, "logsum", False):
+        solver_kwargs["logsum"] = True
+
     results = {True: 0, False: 0, None: 0}
     for ot, res in realize(
         open_input(args),
@@ -711,10 +849,12 @@ def _cmd_realize(args) -> None:
         grid_tries=args.grid_tries,
         use_pc=args.pc,
         max_pc_trials=args.max_pc_trials,
+        on_large_n=_warn_large_n_direct_realize,
+        solver_kwargs=solver_kwargs,
     ):
         results[res] += 1
         tag = "realizable" if res is True else ("non-realizable" if res is False else "unknown")
-        print(f"{tag}: {ot.to_string().strip()}")
+        print(f"{tag}: n={ot.n} slhash={ot.short_sl_hash(args.hash_length)}")
     print(f"\nrealizable: {results[True]}  non-realizable: {results[False]}  unknown: {results[None]}")
 
 
@@ -795,7 +935,7 @@ def _cmd_realize_pc(args) -> None:
                                trials=args.trials, max_pc_trials=args.max_pc_trials):
         results[res] += 1
         tag = "realizable" if res is True else ("non-realizable" if res is False else "unknown")
-        print(f"{tag}: {ot.to_string().strip()}")
+        print(f"{tag}: n={ot.n} slhash={ot.short_sl_hash(args.hash_length)}")
     print(f"\nrealizable: {results[True]}  non-realizable: {results[False]}  unknown: {results[None]}")
 
 
@@ -803,127 +943,683 @@ def _cmd_realize_pc(args) -> None:
 # smart-realize  — Etherealization: reduce point by point
 # ---------------------------------------------------------------------------
 
-def smart_realize(
-    ot: SmallLambda,
-    method: str = "scipy",
-    trials: int = 20,
-    use_pc: bool = True,
-    max_pc_trials: int = 1,
-) -> tuple[bool | None, SmallLambda | None]:
-    """Try to realize an OT by iteratively adding one point at a time.
+def _onion_labeling(ot: SmallLambda, rng=None) -> list:
+    """Phase 0 labeling: onion layers from outermost to innermost.
 
-    Starts from the smallest sub-OT and grows by one point, using the
-    previous realization as a warm start. If realization fails, tries
-    to prove non-realizability of the smallest non-realizable sub-OT.
+    The outermost convex-hull layer comes first, the single innermost point
+    (or the last remaining points) comes last.  ``labeling[j]`` is the index
+    (in the original ``ot``) of the point that becomes point ``j`` after the
+    reordering ``ot.select_points(labeling)``.
 
-    Returns (result, witness) where:
-      result=True  → witness is the realized OT (with realization)
-      result=False → witness is the smallest non-realizable sub-OT found
-      result=None  → undecided
+    If ``rng`` is given, the points *within* each onion layer are shuffled,
+    keeping the outer→inner growth order while varying the insertion order.
     """
-    from pyotlib2.realization.base import Undecided
-    from pyotlib2.algorithms.projective_class import ProjectiveClass
-
-    if method == "gp":
-        from pyotlib2.realization.gp_tester import GPRealizationTester
-        tester = GPRealizationTester()
-    elif method == "scipy":
-        from pyotlib2.realization.scipy_tester import ScipyRealizationTester
-        tester = ScipyRealizationTester(trials=trials)
-    else:
-        raise ValueError(f"Unknown method: {method!r}")
-
-    n = ot.n
-    # build labeling: onion layers from outside in (last point = innermost)
-    bl = ot.to_big_lambda()
-    onion = bl.get_onion()
-    labeling = []
+    onion = ot.to_big_lambda().get_onion()
+    labeling: list = []
     for layer in reversed(onion):
+        layer = list(layer)
+        if rng is not None:
+            rng.shuffle(layer)
         labeling.extend(layer)
-    # pad with any remaining points
-    for i in range(n):
+    for i in range(ot.n):        # safety: append any point the onion missed
         if i not in labeling:
             labeling.append(i)
+    return labeling
 
-    def _try_realize(sub_ot):
-        """Try direct + PC search."""
+
+def _phase0_labeling(ot: SmallLambda, order: str, rng) -> list:
+    """Phase-0 point ordering for etherealization.
+
+    ``order`` selects the strategy — the insertion order is the main lever for
+    getting past a layer where a fixed order dead-ends:
+
+      * ``onion``          outer→inner convex layers (deterministic; default)
+      * ``onion-shuffled`` onion, shuffled within each layer (needs a seed)
+      * ``random``         a fully random permutation (needs a seed)
+      * ``identity``       the input order, unchanged
+    """
+    if order == "identity":
+        return list(range(ot.n))
+    if order == "random":
+        lab = list(range(ot.n))
+        (rng or __import__("random").Random()).shuffle(lab)
+        return lab
+    if order == "onion-shuffled":
+        return _onion_labeling(ot, rng=rng)
+    if order == "onion":
+        return _onion_labeling(ot, rng=None)
+    raise ValueError(f"unknown phase-0 order {order!r}")
+
+
+def smart_realize(
+    ot: SmallLambda,
+    solver: str = "scipy",
+    kmin: int = 4,
+    use_pc: bool = False,
+    max_pc_trials: int = 1,
+    verbose: bool = True,
+    seed: Optional[int] = None,
+    order: str = "onion",
+    export_after_phase1: Optional[str] = None,
+    export_trace: Optional[str] = None,
+    solver_kwargs: Optional[dict] = None,
+) -> tuple[bool | None, SmallLambda | None]:
+    """Etherealization: realize an OT by incrementally growing the point set.
+
+    Faithful reconstruction of the pyotlib1 Etherealization algorithm.
+
+    Phase 0
+        Relabel the points by onion layers (outermost first, innermost last)
+        so the numerically hardest inner points are added last.
+
+    Phase 1 (incremental grow + warm start)
+        Realize the first ``kmin`` points, then grow one point at a time.  To
+        realize ``k+1`` points the ``k``-point realization is attached as
+        ``sub_ot.subrealization`` (warm start) before the tester runs.  If a
+        step fails, phase 2 is entered on that failing configuration.
+
+    Phase 2 (depth search to a minimal non-realizable subconfig)
+        Given an ``m``-point config that failed, try to realize every
+        ``(m-1)``-point subconfig obtained by dropping one of the *first*
+        ``m-1`` points (the newest/last point is kept).  Recurse into any
+        subconfig that itself fails.  If *all* ``(m-1)``-subconfigs are
+        realizable yet the ``m``-config is not, it is a Grassmann-Plücker
+        candidate: the GP-LP is asked to certify non-realizability.  If GP
+        proves it (returns False) a minimal non-realizable example is
+        reported; otherwise the result is "unknown" (a retry point).
+
+    Parameters
+        solver          comma-separated realize chain, e.g. ``"scipy"`` or
+                        ``"scipy,z3"`` (first tried first, rest as fallback).
+        kmin            size of the first configuration realized outright.
+        use_pc          wrap the realize chain in ``PCRealizationTester``.
+        max_pc_trials   PC members to try per OT (only with ``use_pc``).
+        verbose         print per-step progress.
+        export_trace    if given, a folder path into which every distinct sub-OT
+                        encountered in phase 2 (and the phase-1 stall) is written
+                        as a ``.lt`` file named by its ``short_sl_hash()``
+                        (de-duplicated), each with a ``#`` header recording the
+                        original point indices that induce it.
+
+    Returns ``(result, witness)``:
+        result=True  → witness = the realized OT with ``.realization`` set,
+                       mapped back to the ORIGINAL input labeling.
+        result=False → witness = the minimal non-realizable sub-OT (GP
+                       certified).
+        result=None  → unknown / "I don't know" (retry point).
+    """
+    import numpy as np
+    from pyotlib2.core.point_set import PointSet
+    from pyotlib2.realization import make_chain
+    from pyotlib2.realization.base import MAX_REALIZABLE_N
+
+    def log(msg: str) -> None:
+        if verbose:
+            print(msg, flush=True)
+
+    def plog(phase: int, m: int, h: str = "", status: str = "",
+             decision: str = "") -> None:
+        """Compact one-line progress: [ts]  pN  m/n  hash  status  decision."""
+        if not verbose:
+            return
+        from pyotlib2.logging import log_fields
+        log_fields([f"p{phase}", f"{m}/{ot.n}", h, status, decision],
+                   widths=[2, 6, 6, 14, 0])
+
+    # ------------------------------------------------------------------
+    # Build the realize chain (GP is used SEPARATELY as the phase-2 witness)
+    # ------------------------------------------------------------------
+    names = [s.strip() for s in solver.split(",") if s.strip()]
+    if not names:
+        names = ["scipy"]
+    # Build the fallback chain, passing `seed` only to testers that accept it
+    # (z3 / gp have no seed).  seed=None makes the stochastic solvers use fresh
+    # randomness each run, so a run that stalls can make progress on a retry.
+    from pyotlib2.realization import make_tester as _make_tester
+    # Generic solver knobs (precision=, logsum=) forwarded per solver, filtered
+    # to what each tester's constructor accepts (grid/z3/gp have no such knob).
+    extra_all = dict(solver_kwargs or {})
+    realizer = None
+    for name in reversed(names):
+        kw = _accepted_solver_kwargs(name, {**extra_all, "seed": seed})
         try:
-            res = tester.is_realizable(sub_ot)
+            realizer = _make_tester(name, parent=realizer, **kw)
+        except TypeError:
+            # last-resort: drop everything optional if a tester still rejects it
+            realizer = _make_tester(name, parent=realizer)
+    # Projective-class substitution happens at PHASE 0 (below): the whole input
+    # OT is replaced by a random, projectively-equivalent member which is often
+    # less contorted, then etherealized, and the realization is lifted back.  It
+    # is NOT wrapped per growth step (that would re-enumerate the class at every
+    # k — slow and pointless).
+    _pc_back = None
+    _pc_original = None
+    if use_pc:
+        from pyotlib2.realization.pc_tester import PCRealizationTester
+        _pc = PCRealizationTester(realizer, shuffle=True, seed=seed)
+        member, _pc_back = _pc.pick_member(ot)
+        plog(0, ot.n, ot.short_sl_hash(),
+             f"PC member {member.short_sl_hash()}", "etherealize member")
+        _pc_original = ot         # remember the true input OT
+        ot = member               # etherealize the (hopefully easier) member
+
+    # Lazily-created GP tester for phase-2 non-realizability witnesses.
+    _gp_cache: list = []
+
+    def _gp_tester():
+        if not _gp_cache:
+            try:
+                from pyotlib2.realization.gp_tester import GPRealizationTester
+                _gp_cache.append(GPRealizationTester())
+            except Exception as exc:  # glpsol missing etc.
+                log(f"  [gp] unavailable: {exc}")
+                _gp_cache.append(None)
+        return _gp_cache[0]
+
+    # A robust grid fallback: any order type on <= 9 points IS realizable, and
+    # grid backtracking finds it reliably.  We use it whenever the main chain
+    # fails, so a numerically-misleading warm start can never produce a false
+    # "not realizable" for small configurations.
+    from pyotlib2.realization.grid_search import GridSearchTester
+    _grid_fallback = GridSearchTester(max_tries=40)
+
+    def _realize(sub_ot: SmallLambda, subreal: Optional[list]) -> Optional[bool]:
+        """Try to realize ``sub_ot``, hardened against a misleading warm start.
+
+        Order of attempts:
+          1. the chosen realize chain WITH the warm start (fast when it works);
+          2. the chain again WITHOUT the warm start (a bad/tight warm start can
+             mislead the optimizer into failing an otherwise trivial OT);
+          3. the grid backtracking tester (reliable for small n).
+        A ``False`` (proven non-realizable) from any tester is returned as-is.
+        Only if every attempt fails to realize do we report failure — this
+        avoids the spurious "not realizable" signals that corrupt phases 2/3.
+        """
+        for warm in (subreal, None):
+            sub_ot.realization = None
+            sub_ot.subrealization = warm
+            try:
+                res = realizer.is_realizable(sub_ot)
+            except Exception:
+                res = None
             if res is not None:
-                return res
-        except Undecided:
+                return res  # True (realized) or False (proven non-realizable)
+        # last resort: robust grid backtracking (no warm start needed)
+        sub_ot.realization = None
+        sub_ot.subrealization = None
+        try:
+            return _grid_fallback.is_realizable(sub_ot)
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # Phase 0: onion relabeling (reorder WITHOUT lex-min, carries realization)
+    # ------------------------------------------------------------------
+    n = ot.n
+    # Phase-0 insertion order (the main lever for getting past order-specific
+    # dead-ends); randomized variants need a seed to differ run to run.
+    import random as _random
+    _lab_rng = _random.Random(seed) if seed is not None else _random.Random()
+    labeling = _phase0_labeling(ot, order, _lab_rng)
+    work = ot.select_points(labeling)          # point j of `work` == point labeling[j] of `ot`
+    o_target = ot.to_big_lambda().o             # original chirotope (for final verification)
+    plog(0, n, ot.short_sl_hash(), f"order={order}", str(labeling))
+
+    def _witness(idxs: list) -> SmallLambda:
+        """Sub-OT for the given work indices, tagged with the ORIGINAL point
+        labels it was selected from (``.source_indices``) so a saver can record
+        exactly which points of the input induce this sub-order-type."""
+        w = work.select_points(idxs)
+        w.source_indices = [labeling[j] for j in idxs]
+        return w
+
+    # Phase-2 trace export: when a folder is requested, every distinct sub-OT
+    # encountered while drilling down is written there (de-duplicated by hash) so
+    # each can be studied on its own, away from the input's directory.
+    _trace_dir = None
+    _trace_seen: set = set()
+    if export_trace:
+        os.makedirs(export_trace, exist_ok=True)
+        _trace_dir = export_trace
+
+    def _trace(sub_ot: SmallLambda) -> None:
+        if _trace_dir is None:
+            return
+        # Every order type on <= MAX_REALIZABLE_N points is realizable, so a
+        # sub-OT that small is never an interesting non-realizability witness --
+        # don't clutter the trace folder with it.  The trace only ever holds
+        # configurations with n > MAX_REALIZABLE_N.
+        if sub_ot.n <= MAX_REALIZABLE_N:
+            return
+        h = sub_ot.short_sl_hash()
+        if h in _trace_seen:
+            return
+        _trace_seen.add(h)
+        out = os.path.join(_trace_dir, f"{h}.lt")
+        header = [f"smart-realize trace sub-OT  (n={sub_ot.n}, slhash={h})"]
+        src = getattr(sub_ot, "source_indices", None)
+        if src is not None:
+            header.append(f"induced by original point indices: {src}")
+        write_order_types([sub_ot], out, fmt="slt", header=header)
+
+    kmin = max(3, min(kmin, n))
+
+    # ------------------------------------------------------------------
+    # Phase 2: depth search for a MINIMAL non-realizable subconfiguration.
+    # Returns the indices (into `work`) of the smallest configuration whose
+    # every (m-1)-subconfiguration realizes but which itself does not, or None
+    # if no such minimal candidate is isolated on this branch.
+    # ------------------------------------------------------------------
+    def phase2(indices: list, subreal: list, depth: int = 0) -> Optional[list]:
+        m = len(indices)
+        cfg = work.select_points(indices)
+        all_subs_realizable = True
+        for i in range(m - 1):
+            # drop the i-th of the first m-1 points, keep the newest (last)
+            sub_idx = indices[:m - 1]
+            sub_idx = sub_idx[:i] + sub_idx[i + 1:]
+            sub_idx = sub_idx + [indices[-1]]
+            sub_sr = subreal[:i] + subreal[i + 1:]
+
+            sub_ot = work.select_points(sub_idx)
+            _trace(_witness(sub_idx))
+            res = _realize(sub_ot, sub_sr)
+            # Sanity: every order type on <= MAX_REALIZABLE_N points IS
+            # realizable.  If the realizer cannot realize a sub-OT that small,
+            # the realizer -- not the order type -- is at fault; stop hard
+            # rather than silently drilling below n=9.
+            if res is not True and sub_ot.n <= MAX_REALIZABLE_N:
+                raise RuntimeError(
+                    f"smart-realize: realizer failed on an n={sub_ot.n} sub-order "
+                    f"type (slhash={sub_ot.short_sl_hash()}), but every order type "
+                    f"on <= {MAX_REALIZABLE_N} points is realizable -- the realizer "
+                    f"is too weak or broken.  Try a stronger --solver.")
+            plog(2, m - 1, sub_ot.short_sl_hash(),
+                 "realizable" if res is True else "NOT realizable",
+                 "drop -> ok" if res is True else "recurse")
+            if res is True:
+                continue
+            # this (m-1)-subconfig is itself not realizable → recurse deeper
+            all_subs_realizable = False
+            deeper = phase2(sub_idx, sub_sr, depth + 1)
+            if deeper is not None:
+                return deeper
+            # else keep looking through the other drops
+
+        if not all_subs_realizable:
+            # some subconfig failed to realize but no *minimal* candidate was
+            # isolated below it (likely realizer weakness, not a true minimal
+            # non-realizable example).
+            plog(2, m, cfg.short_sl_hash(), "no candidate", "backtrack")
+            return None
+
+        # All (m-1)-subconfigs realizable but the m-config is not → minimal
+        # non-realizable candidate.  GP falsification happens in phase 3.
+        plog(2, m, cfg.short_sl_hash(), "min candidate", "-> phase 3")
+        return list(indices)
+
+    # ------------------------------------------------------------------
+    # Phase 3: GP test + climb.  Start at the minimal candidate and test the
+    # Grassmann-Plücker LP.  If it certifies non-realizability → done (False).
+    # If inconclusive, climb back UP along the original trace (re-add the
+    # removed points in order, then continue k+1..n) and test GP at each step,
+    # until GP fires somewhere.  If GP never fires up to the full n-point set
+    # AND no realization was found, report "I don't know" — a strong sign the
+    # realizer is too weak (a realization may exist but wasn't found), since the
+    # GP LP then cannot fire.
+    # ------------------------------------------------------------------
+    def phase3(cand_indices: list) -> tuple[bool | None, SmallLambda | None]:
+        gp = _gp_tester()
+        # Build the climb trace: candidate indices first, then re-add every
+        # remaining work point (in work order = phase-1 growth order) up to n.
+        present = set(cand_indices)
+        trace_tail = [j for j in range(n) if j not in present]
+        climb = list(cand_indices)
+        steps = [list(climb)] + [climb + trace_tail[:t + 1]
+                                 for t in range(len(trace_tail))]
+        for idxs in steps:
+            cfg = work.select_points(idxs)
+            m = len(idxs)
+            if gp is None:
+                plog(3, m, cfg.short_sl_hash(), "GP unavailable", "cannot certify")
+                return None, _witness(idxs)
+            try:
+                gp_res = gp.is_realizable(cfg)
+            except Exception:
+                gp_res = None
+            if gp_res is False:
+                plog(3, m, cfg.short_sl_hash(), "GP non-realizable",
+                     "=> NON-REALIZABLE")
+                # the *minimal* witness is the candidate we started from
+                return False, _witness(cand_indices)
+            plog(3, m, cfg.short_sl_hash(), "GP inconclusive", "climb")
+        # Reached the full n-point set without GP ever firing.
+        plog(3, n, "", "GP exhausted", "I DON'T KNOW (realizer too weak?)")
+        return None, _witness(cand_indices)
+
+    # ------------------------------------------------------------------
+    # Phase 1: incremental grow with warm start
+    # ------------------------------------------------------------------
+    prev_real: Optional[list] = None
+    for k in range(kmin, n + 1):
+        indices = list(range(k))
+        sub_ot = work.select_points(indices)
+        subreal = prev_real if k > kmin else None
+        res = _realize(sub_ot, subreal)
+        if res is True:
+            prev_real = list(sub_ot.realization)
+            plog(1, k, sub_ot.short_sl_hash(), "realizable", "grow")
+            continue
+        # Failed to realize k points → phase 2 (find minimal candidate), then
+        # phase 3 (GP test + climb).
+        plog(1, k, sub_ot.short_sl_hash(), "NOT realizable", "-> phase 2")
+        _trace(_witness(indices))  # the phase-1 stall config
+        if export_after_phase1:
+            # Write the k-point sub-OT where phase 1 stalled, for manual study.
+            stall = _witness(indices)
+            out = f"{export_after_phase1}.phase1stall_k{k}_{stall.short_sl_hash()}.lt"
+            write_order_types([stall], out, fmt="slt", header=[
+                f"phase-1 stall at k={k}/{n}  (order={order}, seed={seed})",
+                f"slhash = {stall.short_sl_hash()}",
+                f"original point indices: {stall.source_indices}",
+            ])
+            plog(1, k, stall.short_sl_hash(), "exported", out)
+        if prev_real is None:
+            # No warm start available (failed at kmin); still enter phase2.
+            prev_real = []
+        cand_indices = phase2(indices, prev_real)
+        if cand_indices is None:
+            # No minimal candidate isolated → nothing to certify.  This usually
+            # means the realizer is too weak (it failed to realize something
+            # that has realizable sub-parts but no clean minimal witness).
+            plog(2, k, sub_ot.short_sl_hash(), "no candidate",
+                 "I DON'T KNOW (realizer too weak?)")
+            return None, _witness(indices)
+        return phase3(cand_indices)
+
+    # ------------------------------------------------------------------
+    # Success: map the n-point realization back to the ORIGINAL labeling.
+    # ------------------------------------------------------------------
+    # `work` point j corresponds to original point labeling[j]; place the
+    # coordinate of work-point j at original index labeling[j].
+    coords_in_work_order = prev_real
+    orig_coords: list = [None] * n
+    for j in range(n):
+        orig_coords[labeling[j]] = coords_in_work_order[j]
+
+    ps = PointSet(n, orig_coords)
+    if np.array_equal(ps.to_small_lambda(lazy=False).to_big_lambda().o, o_target):
+        # Shrink the (often huge) optimizer coordinates FIRST — small integers
+        # keep the flip/relabel back-transform chain numerically robust and the
+        # final realization readable.
+        realized_ot = SmallLambda(ot.n, ot.get_l().copy(), realization=orig_coords)
+        try:
+            realized_ot = minimize_coords(realized_ot)
+        except Exception:
             pass
-        if use_pc:
-            pc = ProjectiveClass(sub_ot)
-            it = 0
-            for pc_ot in pc.all_ots():
-                it += 1
-                if max_pc_trials and it > max_pc_trials:
-                    break
-                try:
-                    res = tester.is_realizable(pc_ot)
-                    if res is True:
-                        return True
-                    if res is False:
-                        return False
-                except Undecided:
-                    pass
+        final_coords = list(realized_ot.realization)
+
+        # If we etherealized a projective-class member, lift its (now small)
+        # realization back onto the true input order type.
+        if _pc_back is not None:
+            lifted = _pc_back(final_coords)
+            if lifted is None:
+                plog(1, n, ot.short_sl_hash(), "PC back-transform FAILED",
+                     "I DON'T KNOW")
+                return None, _witness(list(range(n)))
+            realized_ot = SmallLambda(_pc_original.n, _pc_original.get_l().copy(),
+                                      realization=lifted)
+            try:
+                realized_ot = minimize_coords(realized_ot)
+            except Exception:
+                pass
+        plog(1, n, realized_ot.short_sl_hash(), "REALIZED", "verified vs original")
+        return True, realized_ot
+
+    # Back-mapping did not reproduce the original chirotope: report unknown
+    # (the contract requires the original labeling).
+    plog(1, n, ot.short_sl_hash(), "back-map FAILED", "I DON'T KNOW")
+    return None, _witness(list(range(n)))
+
+
+def _tester_class_for(method: str):
+    """Return the tester CLASS for a solver name (no instantiation), or None.
+
+    Used to inspect a tester's ``__init__`` signature so generic CLI knobs
+    (``--precision`` / ``--logsum``) can be filtered to the testers that accept
+    them, without needing the tester's external binary to be present.
+    """
+    fam = method.split(".", 1)[0]
+    try:
+        if fam == "scipy":
+            from pyotlib2.realization.scipy_tester import ScipyMethodTester as C
+        elif fam == "nlopt":
+            from pyotlib2.realization.nlopt_tester import NloptMethodTester as C
+        elif fam == "octave":
+            from pyotlib2.realization.octave_tester import OctaveRealizationTester as C
+        elif fam == "sage":
+            from pyotlib2.realization.sage_tester import SageRealizationTester as C
+        elif fam == "mathematica":
+            from pyotlib2.realization.mathematica_tester import MathematicaRealizationTester as C
+        elif fam == "mpmath":
+            from pyotlib2.realization.mpmath_tester import MpmathRealizationTester as C
+        elif fam == "z3":
+            from pyotlib2.realization.z3_tester import Z3RealizationTester as C
+        elif fam == "grid":
+            from pyotlib2.realization.grid_search import GridSearchTester as C
+        elif fam == "gp":
+            from pyotlib2.realization.gp_tester import GPRealizationTester as C
+        else:
+            return None
+        return C
+    except Exception:
         return None
 
-    # grow from sub-OT of size 3 up to n
-    for size in range(3, n + 1):
-        sub_indices = labeling[:size]
-        sub_ot = ot.select_points(sub_indices)
-        print(f"  n={size}: trying realization...", end=" ", flush=True)
-        res = _try_realize(sub_ot)
-        if res is True:
-            print("realizable")
-            if size == n:
-                return True, sub_ot
-        elif res is False:
-            print("non-realizable")
-            return False, sub_ot
-        else:
-            print("unknown")
-            return None, sub_ot
 
-    return None, None
+def _accepted_solver_kwargs(method: str, kw: dict) -> dict:
+    """Keep only the kwargs that ``method``'s tester ``__init__`` accepts.
+
+    Not every solver has a ``precision`` / ``logsum`` knob (grid, z3, gp don't),
+    so a generic ``--precision`` / ``--logsum`` on the CLI must be dropped for
+    testers that would otherwise raise ``TypeError``.
+    """
+    if not kw:
+        return {}
+    import inspect
+    cls = _tester_class_for(method)
+    if cls is None:
+        return dict(kw)
+    try:
+        params = set(inspect.signature(cls.__init__).parameters)
+    except (ValueError, TypeError):
+        return dict(kw)
+    return {k: v for k, v in kw.items() if k in params}
+
+
+def _solver_help() -> str:
+    """A compact listing of the available solvers, grouped by family."""
+    from pyotlib2.realization import SOLVERS
+    families: dict[str, list[str]] = {}
+    for name in SOLVERS:
+        fam = name.split(".", 1)[0]
+        families.setdefault(fam, []).append(name)
+    parts = []
+    for fam in ("scipy", "nlopt", "octave", "sage", "mathematica", "mpmath",
+                "z3", "grid", "gp"):
+        members = sorted(families.get(fam, []))
+        if not members:
+            continue
+        variants = [m.split(".", 1)[1] for m in members if "." in m]
+        if variants:
+            parts.append(f"{fam}.{{{','.join(variants)}}}")
+        else:
+            parts.append(fam)
+    return "Available: " + "; ".join(parts) + "."
 
 
 def _register_smart_realize(sub) -> None:
     p = sub.add_parser(
         "smart-realize",
-        help="Realize OT point-by-point (etherealization)",
+        help="Realize OT point-by-point (etherealization); meant for n > 10",
         description=(
             "Attempt realization by growing the point set one point at a time "
-            "(etherealization / onion-layer order).  "
-            "Starts with a 3-point sub-OT and adds points one by one, "
-            "testing realizability at each step.  "
-            "If a sub-OT cannot be realized, the Grassmann-Plücker LP is used "
-            "to try to certify non-realizability.  "
-            "Optionally searches through the projective class at each step (--no-pc to disable)."
+            "in onion-layer order (etherealization), warm-starting each step "
+            "from the previous realization.  If a step fails, a depth search "
+            "(phase 2) drills down to a minimal non-realizable sub-configuration "
+            "and the Grassmann-Plücker LP is asked to certify it.  "
+            "The realize chain is chosen with --solver (e.g. 'scipy' or "
+            "'scipy,z3'); GP is used only as the non-realizability witness.  "
+            "This is intended for larger order types (n > 10); for small n the "
+            "plain 'realize' command (direct QCP) is faster and sufficient."
         ),
     )
     add_input_args(p)
-    p.add_argument("--method", default="scipy", choices=["scipy", "gp"])
-    p.add_argument("--trials", type=int, default=20)
-    p.add_argument("--no-pc", action="store_false", dest="use_pc",
-                   help="Don't search through projective class")
-    p.add_argument("--max-pc-trials", type=int, default=1)
-    p.set_defaults(func=_cmd_smart_realize, use_pc=True)
+    p.add_argument("--solver", "--realization-tool", dest="solver", default="scipy",
+                   help="Comma-separated realize chain, first tried first "
+                        "(e.g. 'scipy' or 'scipy,z3'; default: scipy).  "
+                        + _solver_help())
+    p.add_argument("--kmin", type=int, default=4,
+                   help="Size of the first configuration realized outright (default: 4)")
+    p.add_argument("--precision", type=int, default=0,
+                   help="Working-precision mantissa bits for arbitrary-precision "
+                        "solvers (mpmath, mathematica); 0 = the solver default. "
+                        "Ignored by solvers without a precision knob.")
+    p.add_argument("--logsum", action="store_true", default=False,
+                   help="Use the log-sum penalty sum log(1+viol) instead of the "
+                        "squared hinge (continuous solvers only).")
+    p.add_argument("--use-pc", action="store_true", default=False,
+                   help="Wrap the realize chain in the projective-class tester")
+    p.add_argument("--max-pc-trials", type=int, default=1,
+                   help="Max PC members to try per OT (only with --use-pc)")
+    p.add_argument("--order", default="onion",
+                   choices=["onion", "onion-shuffled", "random", "identity"],
+                   help="Phase-0 point insertion order (default: onion).  "
+                        "The order is the main lever for getting past a layer "
+                        "where growth dead-ends: 'onion' is deterministic, "
+                        "'onion-shuffled'/'random' vary per --seed / --random-seed, "
+                        "'identity' keeps the input order.")
+    p.add_argument("--seed", type=int, default=None,
+                   help="Fixed random seed for the insertion order and the "
+                        "stochastic solvers (reproducible runs).")
+    p.add_argument("--random-seed", "--true-random", dest="random_seed",
+                   action="store_true",
+                   help="Use a clock-based random seed each run, so a run that "
+                        "stalls explores different starting points on a retry.")
+    p.add_argument("--export-after-phase1", action="store_true",
+                   help="When phase 1 stalls at some k, write that k-point "
+                        "sub-order-type to a file (input path + a suffix) so it "
+                        "can be studied by hand.")
+    p.add_argument("--export-trace", action="store_true",
+                   help="Save every distinct sub-order-type encountered while "
+                        "drilling down (phase 2, and the phase-1 stall) into a "
+                        "separate folder 'INPUT_trace/', one '.lt' file per "
+                        "sub-OT named by its hash.  The folder is created only "
+                        "when this flag is given.")
+    p.add_argument("--output", "-o", dest="output", default=None,
+                   help="Save the result: a realization is written as a point "
+                        "set (.psz), a minimal non-realizable / last sub-OT is "
+                        "written as a rank matrix (.lt) with a comment recording "
+                        "which original point indices induce it.  For multiple "
+                        "input OTs, an index is appended to the filename.")
+    p.set_defaults(func=_cmd_smart_realize)
 
 
 def _cmd_smart_realize(args) -> None:
-    for ot in open_input(args):
-        print(f"OT: {ot.to_string().strip()}")
-        res, witness = smart_realize(ot, method=args.method, trials=args.trials,
-                                     use_pc=args.use_pc, max_pc_trials=args.max_pc_trials)
+    # Resolve the seed: --seed N fixes it (reproducible); --random-seed derives
+    # a fresh one from the clock; otherwise None (the solvers use fresh entropy).
+    seed = args.seed
+    if getattr(args, "random_seed", False):
+        import time
+        seed = int(time.time() * 1000) & 0x7FFFFFFF
+        print(f"using clock-based random seed: {seed}")
+
+    # Identify order types by a short hash instead of dumping the full rank
+    # matrix (which floods the screen for large n / many order types).
+    ots = list(open_input(args))
+    total = len(ots)
+    print(f"loaded {total} order type{'s' if total != 1 else ''}")
+    # Trace folder: 'INPUT_trace/' next to the input file, created only when
+    # --export-trace is set (all OTs of a multi-OT input share the folder).
+    trace_dir = None
+    if getattr(args, "export_trace", False):
+        trace_dir = f"{args.input}_trace"
+
+    solver_kwargs = {}
+    if getattr(args, "precision", 0):
+        solver_kwargs["precision"] = args.precision
+    if getattr(args, "logsum", False):
+        solver_kwargs["logsum"] = True
+
+    for i, ot in enumerate(ots, 1):
+        print(f"\nOT #{i} of {total}  (n={ot.n}, slhash: {ot.short_sl_hash(args.hash_length)})")
+        exp1 = args.input if getattr(args, "export_after_phase1", False) else None
+        res, witness = smart_realize(
+            ot,
+            solver=args.solver,
+            kmin=args.kmin,
+            use_pc=args.use_pc,
+            max_pc_trials=args.max_pc_trials,
+            verbose=True,
+            seed=seed,
+            order=args.order,
+            export_after_phase1=exp1,
+            export_trace=trace_dir,
+            solver_kwargs=solver_kwargs,
+        )
+        hl = args.hash_length
         if res is True:
             print("  => realizable")
+            if witness is not None and witness.realization is not None:
+                print(f"     coords: {list(witness.realization)}")
+                _save_smart_result(args.output, i, total, res, witness, hl)
         elif res is False:
-            print(f"  => non-realizable (smallest non-realizable sub-OT: {witness.to_string().strip()})")
+            print("  => non-realizable")
+            if witness is not None:
+                print(f"     minimal non-realizable sub-OT "
+                      f"(n={witness.n}, slhash: {witness.short_sl_hash(hl)})")
+                _save_smart_result(args.output, i, total, res, witness, hl)
         else:
-            print("  => unknown")
+            print("  => unknown / retry")
+            if witness is not None:
+                print(f"     last configuration "
+                      f"(n={witness.n}, slhash: {witness.short_sl_hash(hl)})")
+                _save_smart_result(args.output, i, total, res, witness, hl)
+
+
+def _save_smart_result(output, i, total, res, witness, hl) -> None:
+    """Write a smart-realize result to a file when ``--output`` was given.
+
+    A realization is written as a point set (.psz, coordinates); a non-realizable
+    or unknown sub-OT is written as a rank matrix (.lt) with a ``#`` comment
+    recording which ORIGINAL point indices induce it (``source_indices``), so the
+    sub-order-type can be reproduced from the input.
+    """
+    if not output:
+        return
+    from pathlib import Path
+    from pyotlib2.io.writers import write_order_types
+
+    base = Path(output)
+    # append the OT index for multi-OT input
+    stem = base.with_suffix("") if total == 1 else Path(f"{base.with_suffix('')}_{i}")
+
+    verdict = ("realizable" if res is True
+               else "non-realizable" if res is False else "unknown")
+    src = getattr(witness, "source_indices", None)
+
+    if res is True and witness.realization is not None:
+        out = stem.with_suffix(".psz")
+        header = [f"smart-realize: {verdict}", f"n = {witness.n}",
+                  f"slhash = {witness.short_sl_hash(hl)}"]
+        write_order_types([witness], str(out), fmt="psz", header=header)
+    else:
+        out = stem.with_suffix(".lt")
+        header = [f"smart-realize: {verdict}", f"n = {witness.n}",
+                  f"slhash = {witness.short_sl_hash(hl)}"]
+        if src is not None:
+            header.append(f"induced by original point indices: {src}")
+        write_order_types([witness], str(out), fmt="slt", header=header)
+    print(f"     saved: {out}")
 
 
 # ---------------------------------------------------------------------------
@@ -965,15 +1661,23 @@ def _register_gp_test(sub) -> None:
         ),
     )
     add_input_args(p)
+    p.add_argument("--export-lp", metavar="FILE", default=None,
+                   help="Write only the Grassmann-Plücker LP to FILE (runnable "
+                        "with 'glpsol --lp FILE' or Gurobi) and do NOT solve.  "
+                        "A per-OT hash is appended for multiple inputs.")
     p.set_defaults(func=_cmd_gp_test)
 
 
 def _cmd_gp_test(args) -> None:
+    if getattr(args, "export_lp", None):
+        _export_lp(list(open_input(args)), args.export_lp, args.hash_length)
+        return
+
     results = {False: 0, None: 0}
     for ot, res in gp_test(open_input(args)):
         results[res] = results.get(res, 0) + 1
         tag = "non-realizable" if res is False else "unknown"
-        print(f"{tag}: {ot.to_string().strip()}")
+        print(f"{tag}: n={ot.n} slhash={ot.short_sl_hash(args.hash_length)}")
     print(f"\nnon-realizable: {results.get(False, 0)}  unknown: {results.get(None, 0)}")
 
 
@@ -1929,7 +2633,6 @@ def walk_points(
     Requires ot.realization to be set.
     """
     import collections
-    import hashlib
     import random
     from math import exp
     from pyotlib2.core.point_set import PointSet
@@ -2003,7 +2706,7 @@ def walk_points(
     directions = list(directions)
 
     def ot_key(pts):
-        return hashlib.md5(PointSet(n, pts).to_small_lambda().to_string().encode()).hexdigest()
+        return PointSet(n, pts).to_small_lambda().sl_hash()
 
     def same_ot(pts_a, pts_b, i):
         ps_a = PointSet(n, pts_a)
@@ -2221,7 +2924,6 @@ def walk_abstract(
     Yields each strictly improving OT found (lex-min representative).
     """
     import collections
-    import hashlib
     import random
     from math import exp
     from pyotlib2.algorithms.exit_edges import filter_exit_edges
@@ -2231,7 +2933,7 @@ def walk_abstract(
     temperature = T0
 
     def ot_key(ot):
-        return hashlib.md5(ot.to_string().encode()).hexdigest()
+        return ot.sl_hash()
 
     if verbose:
         print(f"start: {prop}={start_count}")

@@ -1,0 +1,3 @@
+[submodule "pyotlib2-doc"]
+	path = pyotlib2-doc
+	url = git@github.com:manfredscheucher/pyotlib2-doc.git
