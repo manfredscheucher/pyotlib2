@@ -13,3 +13,23 @@ htmlcov/
 .DS_Store
 old/
 data/
+scripts/benchmark_plots/
+scripts/benchmark_realization_results.json
+
+# Solver export / run artifacts (generated, not source)
+*.wls
+*_trace/
+scripts/_verify_export_out/
+
+# Exploratory / throwaway experiment scripts (kept locally, not in the repo)
+scratch_reconstruct.py
+scripts/_tmp_smart_attempt.py
+scripts/debug_*.py
+scripts/pc_*.py
+scripts/z3*.py
+scripts/realize_test24new*.py
+scripts/decide_test24new_realizable.py
+scripts/search_orders.sh
+scripts/verify_pc_relation.py
+scripts/verify_smart_realize_pc.py
+scripts/verify_export_features.py
