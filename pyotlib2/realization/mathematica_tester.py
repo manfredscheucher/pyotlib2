@@ -142,11 +142,26 @@ class MathematicaRealizationTester(RealizationTester):
             terms.append(f"Log[1 + {hinge}]" if self.logsum else f"{hinge}^2")
         objective = " + ".join(terms)
 
+        # self.precision is in mantissa BITS (matching mpmath's mp.prec and the
+        # --precision flag).  Mathematica's WorkingPrecision counts DECIMAL
+        # digits, so convert: digits = ceil(bits / log2(10)) = ceil(bits * 0.30103).
+        # 0 = MachinePrecision (the solver default), no WorkingPrecision emitted.
+        import math
+        digits = math.ceil(self.precision / math.log2(10)) if (
+            self.precision and self.precision > 0) else 0
+
         opts = [f"Method -> {self._method_option(z0, n)}", "MaxIterations -> 1000"]
-        if self.precision and self.precision > 0:
-            p = self.precision
-            opts += [f"WorkingPrecision -> {p}",
-                     f"AccuracyGoal -> {p}", f"PrecisionGoal -> {p}"]
+        if digits > 0:
+            opts += [f"WorkingPrecision -> {digits}",
+                     f"AccuracyGoal -> {digits}", f"PrecisionGoal -> {digits}"]
+
+        # Acceptance threshold for the "REALIZED" verdict, derived from the chosen
+        # precision -- NOT hardcoded.  With d decimal working digits, treat the
+        # penalty as essentially zero below 10^(-d/2) (half the digits as safety
+        # margin against accumulated round-off).  At MachinePrecision (d=0) fall
+        # back to ~half of double precision (~15 digits) -> 10^-7.
+        eps_exp = (digits // 2) if digits > 0 else 7
+        eps_expr = f"10^-{eps_exp}"
 
         out_escaped = out_path.replace("\\", "\\\\").replace('"', '\\"')
         lines = [
@@ -158,6 +173,8 @@ class MathematicaRealizationTester(RealizationTester):
             # realization was found -- this is the found/not-found indicator.
             "fmin = First[result];",
             "sol = vars /. Last[result];",
+            # eps is the precision-derived REALIZED threshold (see above).
+            f"eps = {eps_expr};",
             # Machine-readable output file: the coordinates, one point per line.
             # (Kept as the primary .out so the in-process solver can read it back.)
             f'Export["{out_escaped}", sol, "Table"];',
@@ -166,7 +183,8 @@ class MathematicaRealizationTester(RealizationTester):
             f'Export["{out_escaped}.objective", {{fmin}}, "Table"];',
             # Human-readable verdict on stdout when run with wolframscript -file.
             'Print["objective = ", fmin];',
-            'If[fmin < 10^-6, Print["REALIZED"], '
+            'Print["threshold = ", eps];',
+            'If[fmin < eps, Print["REALIZED"], '
             'Print["NOT REALIZED (local minimum / precision -- '
             'not a proof of non-realizability)"]];',
             'Print["coords = ", sol];',

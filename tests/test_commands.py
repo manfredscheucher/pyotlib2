@@ -410,10 +410,13 @@ class TestExportHelpers:
 
     def test_export_mathematica_honors_precision_and_logsum(self, tmp_path):
         """--precision and --logsum flow into the exported Mathematica script."""
+        import math
         from pyotlib2.cli.commands import _export_mathematica
         sl = _one_interior(6)
         out = tmp_path / "qcp.m"
         _export_mathematica([sl], str(out), 6, precision=200, logsum=True)
         text = out.read_text()
-        assert "WorkingPrecision -> 200" in text
+        # precision is in BITS; WorkingPrecision counts DECIMAL digits (converted)
+        digits = math.ceil(200 / math.log2(10))  # 61
+        assert f"WorkingPrecision -> {digits}" in text
         assert "Log[" in text
