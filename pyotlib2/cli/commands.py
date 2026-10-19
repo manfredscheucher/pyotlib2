@@ -64,6 +64,11 @@ def register_all(sub) -> None:
     _register_gp_test(sub)
     _register_minimize_coords(sub)
     _register_beautify_coords(sub)
+    # Literal ports of old pyotlib PointSetOptimizer / scripts
+    _register_minimize_integer_coords(sub)
+    _register_beautify_pointset(sub)
+    _register_beautify2(sub)
+    _register_minimize_pattern_search(sub)
     # Local search / property optimization
     _register_walk_points(sub)
     _register_walk_abstract(sub)
@@ -2256,6 +2261,319 @@ def beautify2_coords(
     if ps.to_small_lambda().to_string() == ot_str:
         return SL(n, ot.get_l().copy(), realization=final_pts)
     return ot  # fallback
+
+
+# ===========================================================================
+# Literal ports of the old pyotlib coordinate optimizers (CLI wrappers)
+#
+#   minimize-integer-coords  <- scripts/pyotlib.MinimizeCoords.py (method=minimize)
+#   beautify-pointset        <- scripts/pyotlib.BeautifyCoords.py
+#   beautify2                <- scripts/pyotlib.Beautify2Script.py
+#   minimize-pattern-search  <- scripts/pyotlib.MinimizePatternSearch.py
+#
+# Library code: pyotlib2.algorithms.coord_optimizer.  Defaults are the old
+# scripts' defaults.  Independent of minimize-coords / beautify-coords above.
+# ===========================================================================
+
+def _literal_out(args, suffix: str) -> tuple:
+    """Output path: -o if given, else input path + suffix + input extension
+    (like the old PYOTScript, e.g. foo.psz -> foo.psz.min.psz)."""
+    from pathlib import Path
+    out, fmt = resolve_output(args, suffix)
+    if not args.output:
+        out = Path(str(args.input) + suffix + Path(args.input).suffix)
+    return out, fmt
+
+
+def _normalized_ots(ots: list) -> list:
+    """The old PointSetTextWriter normalized realizations on write (min x = min y = 0)."""
+    for ot in ots:
+        if ot.realization is not None:
+            ot.realization = _pts_normalize(list(ot.realization))
+    return ots
+
+
+def _register_minimize_integer_coords(sub) -> None:
+    p = sub.add_parser(
+        "minimize-integer-coords",
+        help="Literal port of old pyotlib MinimizeCoords (minimizeIntegerCoordinates)",
+        description=(
+            "Minimize the coordinates of realized order types (order type "
+            "preserved).  Literal port of old pyotlib "
+            "scripts/pyotlib.MinimizeCoords.py with method=minimize, i.e. "
+            "PointSetOptimizer.minimizeIntegerCoordinates.  Defaults are the "
+            "old script's defaults.  If --tolerance > 0, order types still "
+            "above the tolerance are also written to <output>.bad.psz, the "
+            "others to <output>.good.psz."
+        ),
+    )
+    add_input_args(p)
+    add_output_args(p, ".min")
+    p.add_argument("--maxtrials", type=int, default=1,
+                   help="Max. number of trials (default: 1)")
+    p.add_argument("--tolerance", type=int, default=0,
+                   help="Number of bits tolerated (not to reduce anymore) (default: 0)")
+    p.add_argument("--randomize", type=int, default=10,
+                   help="Number of randomization trials per phase (default: 10)")
+    p.add_argument("--sheering", type=int, default=0,
+                   help="Also try sheerings (slower) (default: 0)")
+    p.add_argument("--minimize-diameter", type=int, default=0,
+                   help="Minimize the diameter, not just the number of bits (default: 0)")
+    p.add_argument("--symmetric", type=int, default=0,
+                   help="k-fold rotational symmetry to keep (default: 0 = none)")
+    p.add_argument("--prop", default="",
+                   help="Property to keep when minimizing (old code asserts this off; default: none)")
+    p.add_argument("--transformation", default="[1,0,0,1]",
+                   help="Linear map [a,b,c,d]: (x,y) -> (a*x+b*y, c*x+d*y) applied first "
+                        "(default: [1,0,0,1])")
+    p.add_argument("--lazy", type=int, default=1,
+                   help="Check cocircular points only between phases (default: 1)")
+    p.add_argument("--debug", type=int, default=0,
+                   help="1 = progress, 2 = more debug output (default: 0)")
+    p.set_defaults(func=_cmd_minimize_integer_coords)
+
+
+def _cmd_minimize_integer_coords(args) -> None:
+    from ast import literal_eval
+    from pyotlib2.algorithms import coord_optimizer
+    from pyotlib2.algorithms.symmetry import compute_symmetric_ps
+    from pyotlib2.core.point_set import PointSet
+
+    transformation = literal_eval(args.transformation)
+    coord_optimizer.DEBUG = args.debug - 1 if args.debug > 1 else False
+    coord_optimizer.PROVIDE_ALL = False
+    coord_optimizer.LAZY_CHECK_COCIRC = args.lazy != 0
+
+    out, fmt = _literal_out(args, ".min")
+    results, bad, good = [], [], []
+    max_in_bits = max_out_bits = 0
+    improved = not_improved = not_tolerated = 0
+    stats: dict = {}
+    count = 0
+    if not args.debug:
+        print("NOTE: use '--debug 1' to see progress or '--debug 2' for even more debug output")
+
+    for OT in open_input(args):
+        _require_realization(OT, "minimize-integer-coords")
+        count += 1
+        PS = PointSet(OT.n, OT.realization, OT.coloring)
+        print("START", PS.points)
+
+        start_bits = PS.bits()
+        if start_bits > max_in_bits:
+            max_in_bits = start_bits
+
+        if start_bits > args.tolerance:
+            if args.debug:
+                print("Start diam:", PS.diameter())
+            OTstr0 = OT.to_string()
+
+            a, b, c, d = transformation
+            PS.points = [(a * x + b * y, c * x + d * y) for (x, y) in PS.points]
+
+            PS = coord_optimizer.minimize_integer_coordinates(
+                PS, symmetric=args.symmetric, randomize=args.randomize,
+                maxtrials=args.maxtrials, tolerance=args.tolerance, sheering=args.sheering,
+                minimize_diameter=args.minimize_diameter, ensure_property=args.prop)
+
+            if args.symmetric:
+                PS.points = compute_symmetric_ps(PS.points, args.symmetric)
+
+            if PS.diameter() < PointSet(OT.n, OT.realization).diameter():
+                OT.realization = PS.points
+            else:
+                PS.points = OT.realization  # backup
+
+            OTstr = PointSet(OT.n, OT.realization).to_small_lambda().to_string()
+            assert OTstr == OTstr0
+
+        end_bits = PS.bits()
+
+        if end_bits > max_out_bits:
+            max_out_bits = end_bits
+        stats[end_bits] = stats.get(end_bits, 0) + 1
+
+        if not args.symmetric:
+            PS = PointSet(OT.n, OT.realization)
+            PS = PS.normalized()
+            OT.realization = PS.points
+
+        print("END", PS.points)
+
+        results.append(OT)
+        if args.tolerance > 0:
+            (bad if end_bits > args.tolerance else good).append(OT)
+
+        if start_bits > end_bits:
+            improved += 1
+        else:
+            not_improved += 1
+
+        if args.tolerance and end_bits > args.tolerance:
+            not_tolerated += 1
+
+        if (args.tolerance and end_bits > args.tolerance) or (start_bits > end_bits):
+            if args.debug:
+                print("OT#", count, ":", start_bits, "->", end_bits)
+
+    # old: the main writer normalizes unless symmetric; the bad/good writers always
+    # normalize and are named after the input path (outfilepath + ".bad.psz").
+    write_order_types(results if args.symmetric else _normalized_ots(results), out, fmt=fmt)
+    if args.tolerance > 0:
+        from copy import copy
+        base = args.output or args.input
+        write_order_types(_normalized_ots([copy(ot) for ot in bad]), base + ".bad.psz", fmt="psz")
+        write_order_types(_normalized_ots([copy(ot) for ot in good]), base + ".good.psz", fmt="psz")
+
+    print("done.")
+    print("improved       :", improved)
+    print("not improved   :", not_improved)
+    print("max in  bits   :", max_in_bits)
+    print("max out bits   :", max_out_bits)
+    if args.tolerance:
+        print("not tolerated  :", not_tolerated)
+    print(80 * "-")
+    print("statistic:")
+    for i in stats:
+        print("\t", i, "\t", stats[i], "\t", ((100 * stats[i]) // count), "%")
+    print(f"written: {len(results)}  to: {out}")
+
+
+def _register_beautify_pointset(sub) -> None:
+    p = sub.add_parser(
+        "beautify-pointset",
+        help="Literal port of old pyotlib BeautifyCoords (beautifyPointSet)",
+        description=(
+            "Beautify realized order types (order type preserved) by the "
+            "binary-search gradient method.  Literal port of old pyotlib "
+            "scripts/pyotlib.BeautifyCoords.py / "
+            "PointSetOptimizer.beautifyPointSet.  Defaults are the old "
+            "script's defaults."
+        ),
+    )
+    add_input_args(p)
+    add_output_args(p, ".beauty")
+    p.add_argument("--maxiter", type=int, default=100,
+                   help="Max. number of iterations (default: 100)")
+    p.add_argument("--goodbits", type=int, default=0,
+                   help="Number of bits to use (default: 0 = current bits)")
+    p.set_defaults(func=_cmd_beautify_pointset)
+
+
+def _cmd_beautify_pointset(args) -> None:
+    from pyotlib2.algorithms import coord_optimizer
+    from pyotlib2.core.point_set import PointSet
+
+    goodbits = args.goodbits if args.goodbits != 0 else None
+    out, fmt = _literal_out(args, ".beauty")
+    results = []
+    for OT in open_input(args):
+        _require_realization(OT, "beautify-pointset")
+        PS = PointSet(OT.n, OT.realization)
+        slstr = PS.to_small_lambda().to_string()
+
+        coord_optimizer.DEBUG = True
+        PS = coord_optimizer.beautify_point_set(PS, args.maxiter, goodbits)
+
+        assert slstr == PS.to_small_lambda().to_string()
+
+        OT.realization = PS.points
+        results.append(OT)
+    write_order_types(_normalized_ots(results), out, fmt=fmt)
+    print("done.")
+    print(f"written: {len(results)}  to: {out}")
+
+
+def _register_beautify2(sub) -> None:
+    p = sub.add_parser(
+        "beautify2",
+        help="Literal port of old pyotlib Beautify2Script (beautify2, scipy)",
+        description=(
+            "Beautify realized order types (order type preserved) with "
+            "scipy's Nelder-Mead (fmin).  Literal port of old pyotlib "
+            "scripts/pyotlib.Beautify2Script.py / PointSetOptimizer.beautify2.  "
+            "Defaults are the old script's defaults."
+        ),
+    )
+    add_input_args(p)
+    add_output_args(p, ".beauty")
+    p.add_argument("--minimize", type=int, default=1,
+                   help="Run minimizeIntegerCoordinates before/after each scipy run (default: 1)")
+    p.add_argument("--eps", type=float, default=0.0001,
+                   help="Epsilon for convergence (xtol/ftol) (default: 0.0001)")
+    p.add_argument("--norm", type=float, default=1,
+                   help="Norm of the quality function (default: 1)")
+    p.add_argument("--iter1", type=int, default=10,
+                   help="Max number of iterations for outer loop (default: 10)")
+    p.add_argument("--iter2", type=int, default=2000,
+                   help="Max number of iterations for inner scipy fmin (default: 2000)")
+    p.add_argument("--goodbits", type=int, default=30,
+                   help="Scale point set up to this many bits (default: 30)")
+    p.add_argument("--bound", type=int, default=0,
+                   help="Diameter bound (default: 0 = none); requires 2^goodbits <= bound")
+    p.set_defaults(func=_cmd_beautify2)
+
+
+def _cmd_beautify2(args) -> None:
+    from pyotlib2.algorithms import coord_optimizer
+
+    if args.bound > 0:
+        assert 2 ** args.goodbits <= args.bound
+    out, fmt = _literal_out(args, f".beauty{args.iter1}-{args.iter2}")
+    results = []
+    for OT in open_input(args):
+        _require_realization(OT, "beautify2")
+        OT = coord_optimizer.beautify2(OT, args.iter1, args.iter2, goodbits=args.goodbits,
+                                       minimize=args.minimize, diam_bound=args.bound,
+                                       norm=args.norm, epsilon=args.eps)
+        results.append(OT)
+    write_order_types(_normalized_ots(results), out, fmt=fmt)
+    print("done.")
+    print(f"written: {len(results)}  to: {out}")
+
+
+def _register_minimize_pattern_search(sub) -> None:
+    p = sub.add_parser(
+        "minimize-pattern-search",
+        help="Literal port of old pyotlib MinimizePatternSearch",
+        description=(
+            "Try to minimize the diameter of realized order types (order type "
+            "preserved) by an integer pattern search.  Literal port of old "
+            "pyotlib scripts/pyotlib.MinimizePatternSearch.py.  Defaults are "
+            "the old script's defaults.  As in the original, the --blowup "
+            "budget is shared by all order types of the input file."
+        ),
+    )
+    add_input_args(p)
+    add_output_args(p, ".min")
+    p.add_argument("--maxtrials", type=int, default=2000,
+                   help="Max. number of trials (default: 2000)")
+    p.add_argument("--scale", type=int, default=1,
+                   help="How to scale the point set first (default: 1)")
+    p.add_argument("--blowup", type=int, default=0,
+                   help="Number of 2x blow-ups allowed when stuck (default: 0)")
+    p.add_argument("--tolerance", type=int, default=0,
+                   help="Stop when bits <= tolerance (default: 0 = off)")
+    p.add_argument("--debug", type=int, default=0,
+                   help="Print progress every 10 iterations (default: 0)")
+    p.set_defaults(func=_cmd_minimize_pattern_search)
+
+
+def _cmd_minimize_pattern_search(args) -> None:
+    from pyotlib2.algorithms import coord_optimizer
+
+    out, fmt = _literal_out(args, ".min")
+    results = []
+    blowup = args.blowup
+    for OT in open_input(args):
+        _require_realization(OT, "minimize-pattern-search")
+        OT, blowup = coord_optimizer.minimize_pattern_search(
+            OT, maxtrials=args.maxtrials, scale=args.scale, blowup=blowup,
+            tolerance=args.tolerance, DEBUG=args.debug)
+        results.append(OT)
+    write_order_types(_normalized_ots(results), out, fmt=fmt)
+    print("done.")
+    print(f"written: {len(results)}  to: {out}")
 
 
 

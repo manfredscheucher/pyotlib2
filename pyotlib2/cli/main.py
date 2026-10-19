@@ -30,6 +30,12 @@ Coordinate minimization (OT is preserved; only coordinates change):
     minimize-coords   Minimize coordinate size (move-to-even / halve)
     beautify-coords   Beautify coordinates (--method gd|nm)
 
+Literal ports of the old pyotlib coordinate optimizers (OT is preserved):
+    minimize-integer-coords  MinimizeCoords / minimizeIntegerCoordinates
+    beautify-pointset        BeautifyCoords / beautifyPointSet
+    beautify2                Beautify2Script / beautify2 (scipy fmin)
+    minimize-pattern-search  MinimizePatternSearch
+
 Property minimization / local search (OT changes; looks for better OTs):
     walk-points    DFS or random walk in coordinate space (needs coords)
     walk-abstract  DFS or random walk on the flip graph (abstract only)
