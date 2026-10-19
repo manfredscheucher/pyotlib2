@@ -379,3 +379,111 @@ class TestPropertyComputation:
         val, elapsed = self._state(5).compute_property("hull")
         assert isinstance(elapsed, float)
         assert elapsed >= 0.0
+
+
+# ---------------------------------------------------------------------------
+# Onion layers
+# ---------------------------------------------------------------------------
+
+def nested_triangles() -> list[tuple[int, int]]:
+    """Three nested triangles → 3 convex layers."""
+    return [(0, 0), (9000, 500), (4000, 9000),          # outer
+            (3000, 2500), (6000, 2800), (4300, 6000),   # middle
+            (4100, 3500), (4900, 3600), (4400, 4600)]   # inner
+
+
+class TestOnionLayers:
+    def test_count_nested_triangles(self):
+        val, _ = EditorState(nested_triangles()).compute_property("onion-layers")
+        assert val == 3
+
+    def test_count_convex(self):
+        val, _ = EditorState(circle_points(6)).compute_property("onion-layers")
+        assert val == 1
+
+    def test_count_one_interior(self):
+        val, _ = EditorState(one_interior()).compute_property("onion-layers")
+        assert val == 2
+
+    def test_layers_partition_points(self):
+        layers = EditorState(nested_triangles()).get_onion_layers()
+        assert [sorted(l) for l in layers] == [[0, 1, 2], [3, 4, 5], [6, 7, 8]]
+
+
+# ---------------------------------------------------------------------------
+# Caching: recompute only when the order type changes
+# ---------------------------------------------------------------------------
+
+class TestCaching:
+    def test_same_ot_move_keeps_version_and_cache(self):
+        pts = one_interior()
+        state = EditorState(pts)
+        res = state.compute_property("crossings")
+        v = state.ot_version
+        x, y = pts[4]
+        state.move_point(4, x + 5, y - 5)
+        assert state.ot_version == v
+        assert state.compute_property("crossings") is res   # cached object
+
+    def test_ot_change_bumps_version_and_recomputes(self):
+        state = EditorState(one_interior())
+        hull_before, _ = state.compute_property("hull")
+        v = state.ot_version
+        state.move_point(4, GRID_MAX - 100, GRID_MAX // 2)
+        assert state.ot_version != v
+        hull_after, _ = state.compute_property("hull")
+        assert (hull_before, hull_after) == (4, 5)
+
+    def test_matches_full_recompute_after_many_moves(self):
+        """Incremental signs must equal a fresh state after arbitrary moves."""
+        import random
+        rng = random.Random(1)
+        pts = circle_points(7)
+        state = EditorState(pts)
+        for _ in range(60):
+            i = rng.randrange(7)
+            state.move_point(i, rng.randrange(GRID_MAX), rng.randrange(GRID_MAX))
+            fresh = EditorState(state.get_coords())
+            assert state._signs == fresh._signs
+            assert state.collinear_triples == fresh.collinear_triples
+
+    def test_set_coords(self):
+        state = EditorState(circle_points(4))
+        new = [(0, 0), (10, 0), (10, 10), (0, 10)]
+        state.set_coords(new)
+        assert state.get_coords() == new
+        with pytest.raises(ValueError):
+            state.set_coords(new[:3])
+
+    def test_would_change_ot_refuses_collinear(self):
+        pts = [(0, 0), (10, 0), (0, 10), (7, 7)]
+        state = EditorState(pts)
+        # moving point 3 onto the segment (10,0)-(0,10) makes it collinear
+        assert state.would_change_ot(3, 5, 5)
+
+    def test_l_matrix_cached_and_none_when_collinear(self):
+        state = EditorState(circle_points(5))
+        assert state.get_l_matrix() is not None
+        state.move_point(2, *state.get_coords()[0])   # duplicate point
+        assert state.get_l_matrix() is None
+
+
+# ---------------------------------------------------------------------------
+# CLI property counter used by the Property Min/Max walk
+# ---------------------------------------------------------------------------
+
+class TestCountProperty:
+    @pytest.mark.parametrize("key", [k for _, k in __import__(
+        "pyotlib2.vis.editor._state", fromlist=["ALL_PROPERTIES"]).ALL_PROPERTIES])
+    def test_all_editor_properties_supported(self, key):
+        """Every property offered in the editor's walk must be countable."""
+        from pyotlib2.cli.commands import _count_property
+        sl = EditorState(nested_triangles()).get_small_lambda()
+        val, _ = EditorState(nested_triangles()).compute_property(key)
+        assert _count_property(sl, key) == val
+
+    def test_unknown_raises(self):
+        from pyotlib2.cli.commands import _count_property
+        sl = EditorState(circle_points(5)).get_small_lambda()
+        with pytest.raises(ValueError):
+            _count_property(sl, "no-such-property")

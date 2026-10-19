@@ -14,10 +14,13 @@ Tests cover (without a real display):
 - PropertyDialog get_active_keys / get_show_times
 - _run_one_step for all three modes
 - OptimizationPanel signal wiring
-- _normalize_to_grid helper
+- model <-> scene mapping (exact, y flip only)
 - _extend_line_to_rect helper
 - _load_points fallback to default n=6
 - EditorWindow._set_points_from_realization
+- load / save roundtrip without rescaling, binary range check, colors
+- drag snapping, OT-lock veto, Esc deselect, selection not dirty
+- worker exceptions are reported
 """
 
 from __future__ import annotations
@@ -121,32 +124,24 @@ class TestExtendLineToRect:
 
 
 # ---------------------------------------------------------------------------
-# _normalize_to_grid helper
+# Model <-> scene mapping (exact, no rescaling)
 # ---------------------------------------------------------------------------
 
-class TestNormalizeToGrid:
-    def test_output_in_range(self):
-        from pyotlib2.vis.editor._window import _normalize_to_grid
-        from pyotlib2.vis.editor._state import GRID_MAX
-        pts = [(0, 0), (100, 0), (50, 100)]
-        result = _normalize_to_grid(pts)
-        margin = int(GRID_MAX * 0.05)
-        for x, y in result:
-            assert margin <= x <= GRID_MAX - margin
-            assert margin <= y <= GRID_MAX - margin
-
-    def test_preserves_count(self):
-        from pyotlib2.vis.editor._window import _normalize_to_grid
-        pts = [(i * 10, i * 5) for i in range(7)]
-        assert len(_normalize_to_grid(pts)) == 7
+class TestSceneMapping:
+    def test_roundtrip_exact(self):
+        from pyotlib2.vis.editor._window import _to_scene, _to_model
+        for x, y in [(0, 0), (255, 3), (-7, 12), (123456789, -987654)]:
+            assert _to_model(_to_scene(x, y)) == (x, y)
 
     def test_y_flipped(self):
-        """Higher y in input → lower y in output (screen coords)."""
-        from pyotlib2.vis.editor._window import _normalize_to_grid
-        pts = [(0, 0), (100, 0), (0, 100)]
-        result = _normalize_to_grid(pts)
-        # pt[2] has highest y in math → lowest y in screen
-        assert result[2][1] < result[0][1]
+        """Math y up → scene y down."""
+        from pyotlib2.vis.editor._window import _to_scene
+        assert _to_scene(5, 10).y() < _to_scene(5, 0).y()
+
+    def test_to_model_rounds(self):
+        from PySide6.QtCore import QPointF
+        from pyotlib2.vis.editor._window import _to_model
+        assert _to_model(QPointF(1.4, -2.6)) == (1, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +149,12 @@ class TestNormalizeToGrid:
 # ---------------------------------------------------------------------------
 
 class TestLoadPoints:
+    def test_coordinates_unchanged(self, tmp_path):
+        from pyotlib2.vis.editor._window import _load_points
+        f = tmp_path / "p.asc"
+        f.write_text("4\n0 0\n1000000 1\n2000000 3\n5 900000\n")
+        assert _load_points(str(f)) == [(0, 0), (1000000, 1), (2000000, 3), (5, 900000)]
+
     def test_nonexistent_file_returns_default(self):
         from pyotlib2.vis.editor._window import _load_points
         pts = _load_points("/nonexistent/path.b08", n=6)
@@ -589,7 +590,7 @@ class TestMultiOT:
             pytest.skip("otypes06.b08 not available")
         win = EditorWindow(path, n=6)
         assert not win._ctrl._grp_nav.isHidden()
-        assert "OT 1 von" in win._ctrl._lbl_nav.text()
+        assert "OT 1 of" in win._ctrl._lbl_nav.text()
         win.close()
 
     def test_dirty_false_initially(self, qapp):
@@ -624,23 +625,17 @@ class TestMultiOT:
         win.close()
 
     def test_load_ot_resets_dirty(self, qapp):
-        """_load_ot sets _loading=True during move, then resets _dirty=False."""
+        """_load_ot loads the next OT unchanged and resets _dirty."""
         import os
-        from pyotlib2.vis.editor._window import EditorWindow, _normalize_to_grid
+        from pyotlib2.vis.editor._window import EditorWindow
         path = os.path.join(os.path.dirname(__file__), "otdb", "otypes", "otypes06.b08")
         if not os.path.exists(path):
             pytest.skip("otypes06.b08 not available")
         win = EditorWindow(path, n=6)
-        # mark dirty directly
         win._dirty = True
-        # Simulate the _load_ot logic without heavy Qt rendering:
-        # _load_ot sets _loading=True, moves points (triggers updated → dirty check),
-        # then sets _loading=False and _dirty=False
-        win._loading = True
-        # (points would move here, but we skip to avoid Qt hang)
-        win._loading = False
-        win._dirty = False   # <- this is what _load_ot does after the move loop
+        win._load_ot(1)
         assert not win._dirty
+        assert win.state.get_coords() == [tuple(p) for p in win._all_ots[1].realization]
         win.close()
 
     def test_confirm_discard_clean_returns_true(self, qapp):
@@ -679,3 +674,189 @@ class TestMultiOT:
         win._dirty = False
         assert win._ot_index == 1
         win.close()
+
+
+# ---------------------------------------------------------------------------
+# Load / save: original coordinates, no rescaling
+# ---------------------------------------------------------------------------
+
+# Rescaling these into a 10000 grid would make points 0, 1, 2 collinear.
+_WIDE_PTS = [(0, 0), (1000000, 1), (2000000, 3), (5, 900000), (1500000, 700000)]
+
+
+def _write_asc(path, pts, colors=None):
+    rows = [f"{x} {y}" + (f" {colors[i]}" if colors else "") for i, (x, y) in enumerate(pts)]
+    path.write_text(f"{len(pts)}\n" + "\n".join(rows) + "\n")
+
+
+class TestLoadSave:
+    def test_window_keeps_file_coordinates(self, qapp, tmp_path):
+        from pyotlib2.vis.editor._window import EditorWindow
+        f = tmp_path / "wide.asc"
+        _write_asc(f, _WIDE_PTS)
+        win = EditorWindow(str(f))
+        assert win.state.get_coords() == _WIDE_PTS
+        assert not win.state.has_collinear
+        win.close()
+
+    def test_save_asc_roundtrip(self, tmp_path):
+        from pyotlib2.vis.editor._window import _write_points, _load_points
+        f = tmp_path / "out.asc"
+        _write_points(f, _WIDE_PTS)
+        assert _load_points(str(f)) == _WIDE_PTS
+
+    def test_save_without_suffix_is_asc(self, tmp_path):
+        from pyotlib2.vis.editor._window import _write_points
+        f = tmp_path / "out"
+        _write_points(f, _WIDE_PTS)
+        assert f.read_text().splitlines()[1] == "0 0"
+
+    def test_save_keeps_colors(self, qapp, tmp_path):
+        from pyotlib2.vis.editor._window import EditorWindow, _write_points
+        from pyotlib2.io.readers import read_order_types
+        src = tmp_path / "in.psz"
+        colors = ["R", "B", "R", "B", "R"]
+        _write_asc(src, _WIDE_PTS, colors)
+        win = EditorWindow(str(src))
+        for name in ("out.asc", "out.psz"):
+            _write_points(tmp_path / name, win.state.get_coords(), win._coloring)
+            sl = next(read_order_types(tmp_path / name))
+            assert [tuple(p) for p in sl.realization] == _WIDE_PTS
+            assert [sl.coloring[i] for i in range(5)] == colors
+        win.close()
+
+    def test_save_b08_out_of_range_message(self, tmp_path):
+        from pyotlib2.vis.editor._window import _write_points
+        f = tmp_path / "out.b08"
+        with pytest.raises(ValueError, match=r"0\.\.255.*\.b16"):
+            _write_points(f, _WIDE_PTS)
+        assert not f.exists()
+
+    def test_save_b08_negative_rejected(self, tmp_path):
+        from pyotlib2.vis.editor._window import _write_points
+        with pytest.raises(ValueError):
+            _write_points(tmp_path / "out.b08", [(-1, 0), (5, 0), (0, 5)])
+
+    @pytest.mark.parametrize("suffix,top", [("b08", 255), ("b16", 65535)])
+    def test_save_binary_roundtrip(self, tmp_path, suffix, top):
+        from pyotlib2.vis.editor._window import _write_points
+        from pyotlib2.io.readers import read_order_types
+        pts = [(0, 0), (top, 1), (3, top), (top // 2, top // 3)]
+        f = tmp_path / f"out.{suffix}"
+        _write_points(f, pts)
+        sl = next(read_order_types(f, n=4))
+        assert [tuple(p) for p in sl.realization] == pts
+
+    def test_optimisation_result_not_renormalised(self, qapp):
+        from pyotlib2.vis.editor._window import EditorWindow
+        win = EditorWindow()
+        new = [(0, 0), (7, 1), (9, 6), (5, 11), (-2, 8), (-3, 3)]
+        win._set_points_from_realization(new)
+        assert win.state.get_coords() == new
+        win._dirty = False
+        win.close()
+
+
+# ---------------------------------------------------------------------------
+# Dragging (programmatic setPos goes through itemChange)
+# ---------------------------------------------------------------------------
+
+class TestDrag:
+    def test_drag_snaps_to_integer_model_coords(self, qapp, state5_interior):
+        from PySide6.QtCore import QPointF
+        from pyotlib2.vis.editor._window import EditorScene
+        scene = EditorScene(state5_interior)
+        x, y = state5_interior.get_coords()[4]
+        scene._point_items[4].setPos(QPointF(x + 10.4, -(y + 20.6)))
+        assert state5_interior.get_coords()[4] == (x + 10, y + 21)
+        assert scene._point_items[4].pos() == QPointF(x + 10, -(y + 21))
+
+    def test_ot_lock_vetoes_drag(self, qapp, state5_interior):
+        from PySide6.QtCore import QPointF
+        from pyotlib2.vis.editor._window import EditorScene
+        from pyotlib2.vis.editor._state import GRID_MAX
+        scene = EditorScene(state5_interior)
+        scene.ot_lock = True
+        state5_interior.lock_current_ot()
+        item = scene._point_items[4]
+        old_pos = item.pos()
+        original = state5_interior.get_coords()[4]
+        # inside the scene rect, but outside the hull → OT change
+        item.setPos(QPointF(GRID_MAX * 0.74, -GRID_MAX * 0.5))
+        assert state5_interior.get_coords()[4] == original
+        assert item.pos() == old_pos
+        assert not state5_interior.ot_changed
+
+    def test_ot_lock_allows_small_drag(self, qapp, state5_interior):
+        from PySide6.QtCore import QPointF
+        from pyotlib2.vis.editor._window import EditorScene
+        scene = EditorScene(state5_interior)
+        scene.ot_lock = True
+        state5_interior.lock_current_ot()
+        x, y = state5_interior.get_coords()[4]
+        scene._point_items[4].setPos(QPointF(x + 3, -(y + 3)))
+        assert state5_interior.get_coords()[4] == (x + 3, y + 3)
+
+
+# ---------------------------------------------------------------------------
+# Selection: Esc deselects, selection is not an edit
+# ---------------------------------------------------------------------------
+
+class TestSelection:
+    def test_esc_deselects(self, qapp, scene6):
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QKeyEvent
+        from PySide6.QtCore import QEvent
+        from pyotlib2.vis.editor._window import EditorView
+        view = EditorView(scene6)
+        scene6.toggle_selected(3)
+        view.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier))
+        assert scene6._selected is None
+        assert not any(p._selected for p in scene6._point_items)
+
+    def test_esc_without_selection_is_noop(self, qapp, scene6):
+        scene6.clear_selection()
+        assert scene6._selected is None
+
+    def test_selection_does_not_mark_dirty(self, qapp):
+        from pyotlib2.vis.editor._window import EditorWindow
+        win = EditorWindow()
+        win._scene.toggle_selected(1)
+        win._scene.toggle_selected(1)
+        win._scene.set_hide_incident(True)
+        assert not win._dirty
+        win.close()
+
+    def test_move_marks_dirty(self, qapp):
+        from pyotlib2.vis.editor._window import EditorWindow
+        win = EditorWindow()
+        x, y = win.state.get_coords()[0]
+        win.move_point(0, x + 1, y)
+        assert win._dirty
+        win._dirty = False
+        win.close()
+
+
+# ---------------------------------------------------------------------------
+# Optimization worker / property walk
+# ---------------------------------------------------------------------------
+
+class TestWorkerErrors:
+    def test_worker_reports_exception(self, qapp, state5_interior):
+        from pyotlib2.vis.editor._window import OptimizationWorker
+        sl = state5_interior.get_small_lambda()
+        worker = OptimizationWorker("property", "no-such-property", "minimize",
+                                    sl, state5_interior.get_coords())
+        errors = []
+        worker.failed.connect(errors.append)
+        worker.run()   # synchronously; must return instead of looping/dying
+        assert len(errors) == 1
+        assert "no-such-property" in errors[0]
+
+    @pytest.mark.parametrize("prop", ["triangulations", "onion-layers"])
+    def test_property_step_supports_prop(self, qapp, state5_interior, prop):
+        from pyotlib2.vis.editor._window import _run_one_step
+        sl = state5_interior.get_small_lambda()
+        result = _run_one_step("property", prop, "minimize", sl,
+                               state5_interior.get_coords())
+        assert result is None or len(result) == 5

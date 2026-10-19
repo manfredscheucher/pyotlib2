@@ -2558,7 +2558,8 @@ _PROP_HELP = (
     "  empty-kgons-K    number of empty convex K-gons (e.g. empty-kgons-5)\n"
     "  kgons-K          number of convex K-gons\n"
     "  hull             number of convex hull points\n"
-    "  onion-layers     number of convex layers"
+    "  onion-layers     number of convex layers\n"
+    "  triangulations   number of triangulations"
 )
 
 
@@ -2581,6 +2582,9 @@ def _count_property(ot: SmallLambda, prop: str) -> int:
     elif prop.startswith("kgons-"):
         k = int(prop.removeprefix("kgons-"))
         return count_polygons(ot.big_lambda, k, empty_only=False)
+    elif prop == "triangulations":
+        from pyotlib2.algorithms.triangulations import count_triangulations
+        return count_triangulations(ot)
     else:
         raise ValueError(f"Unknown property: {prop!r}. Available:\n{_PROP_HELP}")
 
@@ -2613,8 +2617,11 @@ def walk_points(
     T0: float = 0.1,
     dT: float = 0.999,
     verbose: bool = True,
+    maximize: bool = False,
 ) -> Iterator[SmallLambda]:
-    """Local search in coordinate space to minimize a property.
+    """Local search in coordinate space to minimize a property
+    (or to maximize it, with ``maximize=True``: the search then minimizes the
+    negated value; simulated annealing only applies when minimizing).
 
     Two modes (selected via random_walk):
 
@@ -2637,6 +2644,10 @@ def walk_points(
     from math import exp
     from pyotlib2.core.point_set import PointSet
 
+    def score(sl) -> int:
+        c = _count_property(sl, prop)
+        return -c if maximize else c
+
     pts = _require_realization(ot, "walk-points")
     n = ot.n
 
@@ -2647,12 +2658,12 @@ def walk_points(
         pts = [(x * scale, y * scale) for x, y in pts]
     pts = _pts_normalize(pts)
 
-    start_count = _count_property(PointSet(n, pts).to_small_lambda(), prop)
+    start_count = score(PointSet(n, pts).to_small_lambda())
     min_count = start_count
     temperature = T0
 
     if verbose:
-        print(f"start: {prop}={start_count}")
+        print(f"start: {prop}={abs(start_count)}")
 
     # ---- random walk mode ----
     if random_walk:
@@ -2680,7 +2691,7 @@ def walk_points(
                 continue
 
             new_ot = ps.to_small_lambda()
-            new_count = _count_property(new_ot, prop)
+            new_count = score(new_ot)
 
             if new_count > min_count:
                 pts[i] = (x, y)
@@ -2690,7 +2701,7 @@ def walk_points(
                 min_count = new_count
                 pts = _pts_normalize(pts)
                 if verbose:
-                    print(f"  improved: {prop}={min_count}")
+                    print(f"  improved: {prop}={abs(min_count)}")
                 yield new_ot
                 if stop_if_improved:
                     return
@@ -2793,7 +2804,7 @@ def walk_points(
             continue
 
         new_sl = PointSet(n, pts_new).to_small_lambda()
-        new_count = _count_property(new_sl, prop)
+        new_count = score(new_sl)
 
         accept = new_count <= frame.count
         if not accept and siman:
@@ -2808,7 +2819,7 @@ def walk_points(
         if new_count < min_count:
             min_count = new_count
             if verbose:
-                print(f"  improved: {prop}={min_count}")
+                print(f"  improved: {prop}={abs(min_count)}")
             yield new_sl
             if stop_if_improved:
                 return

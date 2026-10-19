@@ -199,6 +199,19 @@ class TestWalkPoints:
         for r in results:
             assert r._is_valid_abstract()
 
+    def test_maximize_yields_increasing_values(self):
+        """walk_points(maximize=True) moves towards larger values (convex position has the most crossings)."""
+        import random
+        from pyotlib2.cli.commands import walk_points, _count_property
+        random.seed(0)
+        sl = _one_interior(6)
+        start = _count_property(sl, "crossings")
+        values = [_count_property(r, "crossings") for r in walk_points(
+            sl, "crossings", random_walk=True, trials=2000, verbose=False, maximize=True,
+        )]
+        assert values, "no improvement found"
+        assert all(a < b for a, b in zip([start] + values, values))
+
     def test_requires_realization(self):
         from pyotlib2.cli.commands import walk_points
         sl = _convex_abstract(5)

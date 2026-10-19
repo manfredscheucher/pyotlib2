@@ -4,7 +4,7 @@ Architecture
 ------------
 - EditorState (_state.py): pure-Python, integer coordinates, OT logic
 - EditorScene:  QGraphicsScene — full lines, points, hull overlay
-- EditorView:   QGraphicsView  — zoom (wheel + +/-), pan (Space+drag)
+- EditorView:   QGraphicsView  — zoom (wheel + +/-), pan (middle-drag)
 - InfoPanel:    coordinates + L-matrix display
 - PropertiesPanel: live property values
 - PropertyDialog: "Select properties" popup
@@ -13,9 +13,12 @@ Architecture
 
 Coordinate mapping
 ------------------
-Scene coordinates = logical integer grid [0, GRID_MAX] × [0, GRID_MAX].
-Y-axis: screen (y downward) — we flip on load from math convention.
-Zoom is handled by QGraphicsView.scale(), so scene coords never change.
+The model (EditorState) keeps the original integer coordinates of the
+loaded point set (math convention, y up).  The only mapping is
+scene = (x, -y) (see _to_scene / _to_model), which is exact for integers;
+fitting and zooming are done by the QGraphicsView transform.  Points,
+labels and pens are drawn in pixel units (ItemIgnoresTransformations /
+cosmetic pens), so the drawing works for any coordinate range.
 """
 
 from __future__ import annotations
@@ -33,7 +36,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QMainWindow, QGraphicsScene, QGraphicsView, QGraphicsEllipseItem,
-    QGraphicsPolygonItem, QGraphicsLineItem, QGraphicsTextItem,
+    QGraphicsPolygonItem, QGraphicsLineItem, QGraphicsRectItem,
+    QGraphicsSimpleTextItem,
     QStatusBar, QFileDialog, QLabel, QGraphicsItem, QWidget,
     QHBoxLayout, QVBoxLayout, QTextEdit, QCheckBox, QGroupBox,
     QSplitter, QPushButton, QFrame, QComboBox, QDialog,
@@ -49,7 +53,7 @@ from pyotlib2.vis.editor._state import (
 # Visual constants
 # ---------------------------------------------------------------------------
 
-POINT_RADIUS     = 120          # in scene units (GRID_MAX = 10000)
+POINT_RADIUS     = 6            # in pixels (independent of zoom / coordinates)
 COLOR_POINT      = QColor("#2c3e50")
 COLOR_POINT_SEL  = QColor("#e74c3c")
 COLOR_POINT_COL  = QColor("#e74c3c")   # collinear → red
@@ -70,6 +74,23 @@ COLOR_AXIS         = QColor(200, 200, 200, 180)
 # DraggablePoint
 # ---------------------------------------------------------------------------
 
+def _to_scene(x: int, y: int) -> QPointF:
+    """Model (math, y up) → scene (y down).  Exact for integers."""
+    return QPointF(x, -y)
+
+
+def _to_model(pos: QPointF) -> tuple[int, int]:
+    """Scene → nearest integer model coordinates."""
+    return int(round(pos.x())), int(round(-pos.y()))
+
+
+def _cosmetic_pen(color: QColor, width: float) -> QPen:
+    """Pen whose width is in pixels, independent of the view transform."""
+    pen = QPen(color, width)
+    pen.setCosmetic(True)
+    return pen
+
+
 class DraggablePoint(QGraphicsEllipseItem):
     def __init__(self, index: int, x: int, y: int, scene: "EditorScene"):
         r = POINT_RADIUS
@@ -78,14 +99,27 @@ class DraggablePoint(QGraphicsEllipseItem):
         self._scene = scene
         self._selected = False
         self._collinear = False
-        self._last_valid_pos = QPointF(x, y)
-        self.setPos(x, y)
+        self._syncing = False
+        self.setPos(_to_scene(x, y))
+        # drawn in pixels; the label is a child and inherits this
+        self.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
         self.setFlag(QGraphicsItem.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
         self.setAcceptHoverEvents(True)
         self._refresh_color()
         self.setPen(QPen(Qt.NoPen))
         self.setZValue(10)
+
+        lbl = QGraphicsSimpleTextItem(str(index), self)
+        lbl.setBrush(QBrush(QColor("#7f8c8d")))
+        lbl.setFont(QFont("Arial", 9))
+        lbl.setPos(r + 2, -r - lbl.boundingRect().height())
+
+    def sync_pos(self, x: int, y: int) -> None:
+        """Programmatic move to model (x, y), bypassing the drag logic."""
+        self._syncing = True
+        self.setPos(_to_scene(x, y))
+        self._syncing = False
 
     def _refresh_color(self):
         if self._collinear:
@@ -100,8 +134,9 @@ class DraggablePoint(QGraphicsEllipseItem):
         self._refresh_color()
 
     def set_collinear(self, val: bool):
-        self._collinear = val
-        self._refresh_color()
+        if val != self._collinear:
+            self._collinear = val
+            self._refresh_color()
 
     def hoverEnterEvent(self, event):
         if not self._selected and not self._collinear:
@@ -117,27 +152,26 @@ class DraggablePoint(QGraphicsEllipseItem):
             self._scene.toggle_selected(self.index)
             event.accept()
             return
-        self._last_valid_pos = self.pos()
         super().mousePressEvent(event)
 
     def itemChange(self, change, value):
+        if self._syncing:
+            return super().itemChange(change, value)
+        if change == QGraphicsItem.ItemPositionChange:
+            # snap the proposed position to integer model coordinates,
+            # clamped to the scene rect
+            rect = self._scene.sceneRect()
+            pos = QPointF(min(max(value.x(), rect.left()), rect.right()),
+                          min(max(value.y(), rect.top()), rect.bottom()))
+            ix, iy = _to_model(pos)
+            # OT lock: veto the move, the point stays where it is
+            if self._scene.ot_lock and self._scene.state.would_change_ot(self.index, ix, iy):
+                return self.pos()
+            return _to_scene(ix, iy)
         if change == QGraphicsItem.ItemPositionHasChanged:
-            pos = self.pos()
-            ix = int(round(pos.x()))
-            iy = int(round(pos.y()))
-            # clamp to grid
-            ix = max(0, min(GRID_MAX, ix))
-            iy = max(0, min(GRID_MAX, iy))
-            # OT lock: check before committing
-            if self._scene.ot_lock:
-                result = self._scene.state.would_change_ot(self.index, ix, iy)
-                if result:
-                    # snap back to last valid position
-                    self.setPos(self._last_valid_pos)
-                    return self._last_valid_pos
-            self._last_valid_pos = QPointF(ix, iy)
+            ix, iy = _to_model(self.pos())
             self._scene.state.move_point(self.index, ix, iy)
-            self._scene.refresh()
+            self._scene.refresh(moved=self.index)
         return super().itemChange(change, value)
 
 
@@ -148,12 +182,10 @@ class DraggablePoint(QGraphicsEllipseItem):
 class EditorScene(QGraphicsScene):
     """Scene: full lines through all point pairs + hull overlay + points."""
 
-    updated = Signal()
+    updated = Signal()   # point coordinates changed
 
     def __init__(self, state: EditorState, parent=None):
         super().__init__(parent)
-        margin = GRID_MAX * 0.02
-        self.setSceneRect(-margin, -margin, GRID_MAX + 2 * margin, GRID_MAX + 2 * margin)
         self.state = state
         self.ot_lock = False
 
@@ -163,7 +195,7 @@ class EditorScene(QGraphicsScene):
         self._point_items: list[DraggablePoint] = []
         self._line_items: list[tuple[int, int, QGraphicsLineItem]] = []
         self._hull_items: list[QGraphicsPolygonItem] = []
-        self._label_items: list[QGraphicsTextItem] = []
+        self._border = QGraphicsRectItem()
 
         self._selected: Optional[int] = None
 
@@ -174,46 +206,68 @@ class EditorScene(QGraphicsScene):
     # ------------------------------------------------------------------
 
     def move_point(self, index: int, x: int, y: int) -> None:
-        """Programmatic move (for tests)."""
+        """Programmatic move of one point (model coordinates)."""
         self.state.move_point(index, x, y)
-        self._point_items[index].setPos(x, y)
-        self._point_items[index]._last_valid_pos = QPointF(x, y)
+        self._point_items[index].sync_pos(*self.state.get_coords()[index])
+        self.refresh(moved=index)
+
+    def set_points(self, pts: list[tuple[int, int]]) -> None:
+        """Replace all coordinates unchanged (load / optimisation result)
+        and refit the scene rect to them."""
+        self.state.set_coords(pts)
+        self.fit_scene_rect()
         self.refresh()
+
+    def fit_scene_rect(self) -> None:
+        """Scene rect = bounding box of the points plus a margin."""
+        coords = self.state.get_coords()
+        xs = [x for x, _ in coords] or [0]
+        ys = [-y for _, y in coords] or [0]
+        w, h = max(xs) - min(xs), max(ys) - min(ys)
+        margin = 0.1 * (max(w, h) or 1)
+        rect = QRectF(min(xs) - margin, min(ys) - margin, w + 2 * margin, h + 2 * margin)
+        self.setSceneRect(rect)
+        self._border.setRect(rect)
 
     def toggle_selected(self, index: int) -> None:
         if self._selected == index:
+            self.clear_selection()
+            return
+        if self._selected is not None:
+            self._point_items[self._selected].set_selected(False)
+        self._selected = index
+        self._point_items[index].set_selected(True)
+        self._refresh_line_pens()
+
+    def clear_selection(self) -> None:
+        if self._selected is not None:
+            self._point_items[self._selected].set_selected(False)
             self._selected = None
-            self._point_items[index].set_selected(False)
-        else:
-            if self._selected is not None:
-                self._point_items[self._selected].set_selected(False)
-            self._selected = index
-            self._point_items[index].set_selected(True)
-        self._refresh_lines()
-        self.updated.emit()
+            self._refresh_line_pens()
 
     def set_hide_incident(self, val: bool) -> None:
         self._hide_incident = val
-        self._refresh_lines()
+        self._refresh_line_pens()
 
     def set_highlight_mode(self, mode: str) -> None:
         self._highlight_mode = mode
         self._refresh_hull()
 
-    def refresh(self) -> None:
+    def refresh(self, moved: Optional[int] = None) -> None:
+        """Redraw after a coordinate change.  *moved*: index of the only
+        point that moved (its item is already in place), else all."""
         coords = self.state.get_coords()
-        # update point positions (in case of programmatic move)
-        for i, (x, y) in enumerate(coords):
-            self._point_items[i].setPos(x, y)
+        if moved is None:
+            for i, (x, y) in enumerate(coords):
+                self._point_items[i].sync_pos(x, y)
         # collinear highlighting
         collinear_pts = set()
         for a, b, c in self.state.collinear_triples:
             collinear_pts |= {a, b, c}
         for i, pt in enumerate(self._point_items):
             pt.set_collinear(i in collinear_pts)
-        self._refresh_lines()
+        self._refresh_line_geometry(moved)
         self._refresh_hull()
-        self._refresh_labels()
         self.updated.emit()
 
     # ------------------------------------------------------------------
@@ -221,7 +275,10 @@ class EditorScene(QGraphicsScene):
     # ------------------------------------------------------------------
 
     def _build_all(self):
-        self._draw_axes()
+        self._border.setPen(_cosmetic_pen(COLOR_AXIS, 1.5))
+        self._border.setZValue(0)
+        self.addItem(self._border)
+        self.fit_scene_rect()
 
         n = self.state.n
         coords = self.state.get_coords()
@@ -234,53 +291,37 @@ class EditorScene(QGraphicsScene):
                 self.addItem(line)
                 self._line_items.append((i, j, line))
 
-        # points + labels
+        # points (with their labels)
         for i, (x, y) in enumerate(coords):
             pt = DraggablePoint(i, x, y, self)
             self.addItem(pt)
             self._point_items.append(pt)
 
-            lbl = QGraphicsTextItem(str(i))
-            lbl.setDefaultTextColor(QColor("#7f8c8d"))
-            lbl.setFont(QFont("Arial", max(1, POINT_RADIUS // 2)))
-            lbl.setZValue(11)
-            self.addItem(lbl)
-            self._label_items.append(lbl)
-
+        self._refresh_line_pens()
         self.refresh()
 
-    def _draw_axes(self):
-        """Draw a light border around the grid."""
-        pen = QPen(COLOR_AXIS, 30)
-        for x0, y0, x1, y1 in [
-            (0, 0, GRID_MAX, 0),
-            (GRID_MAX, 0, GRID_MAX, GRID_MAX),
-            (GRID_MAX, GRID_MAX, 0, GRID_MAX),
-            (0, GRID_MAX, 0, 0),
-        ]:
-            item = QGraphicsLineItem(x0, y0, x1, y1)
-            item.setPen(pen)
-            item.setZValue(0)
-            self.addItem(item)
-
-    def _refresh_lines(self):
-        """Recompute and redraw all full lines through each pair of points."""
+    def _refresh_line_geometry(self, moved: Optional[int] = None):
+        """Recompute the full lines through each pair of points (only the
+        lines through *moved* if given)."""
         coords = self.state.get_coords()
         rect = self.sceneRect()
         for i, j, line in self._line_items:
+            if moved is not None and moved != i and moved != j:
+                continue
             x0, y0 = coords[i]
             x1, y1 = coords[j]
             # extend line to scene rect boundary
-            p1, p2 = _extend_line_to_rect(x0, y0, x1, y1, rect)
+            p1, p2 = _extend_line_to_rect(x0, -y0, x1, -y1, rect)
             line.setLine(p1.x(), p1.y(), p2.x(), p2.y())
-            # visibility / color
+
+    def _refresh_line_pens(self):
+        """Line colors (depend on selection / hide-incident only)."""
+        pen_normal = _cosmetic_pen(COLOR_LINE_NORMAL, 1)
+        pen_hidden = _cosmetic_pen(COLOR_LINE_HIDDEN, 1)
+        for i, j, line in self._line_items:
             is_incident = (self._selected is not None and
                            (i == self._selected or j == self._selected))
-            if self._hide_incident and is_incident:
-                pen = QPen(COLOR_LINE_HIDDEN, 15)
-            else:
-                pen = QPen(COLOR_LINE_NORMAL, 15)
-            line.setPen(pen)
+            line.setPen(pen_hidden if self._hide_incident and is_incident else pen_normal)
 
     def _refresh_hull(self):
         for item in self._hull_items:
@@ -313,19 +354,13 @@ class EditorScene(QGraphicsScene):
         cy = sum(coords[i][1] for i in ids) / len(ids)
         sorted_ids = sorted(ids, key=lambda i: math.atan2(
             coords[i][1] - cy, coords[i][0] - cx))
-        poly = QPolygonF([QPointF(coords[i][0], coords[i][1]) for i in sorted_ids])
+        poly = QPolygonF([_to_scene(*coords[i]) for i in sorted_ids])
         item = QGraphicsPolygonItem(poly)
         item.setBrush(QBrush(fill))
-        item.setPen(QPen(stroke, 30))
+        item.setPen(_cosmetic_pen(stroke, 1.5))
         item.setZValue(0)
         self.addItem(item)
         self._hull_items.append(item)
-
-    def _refresh_labels(self):
-        coords = self.state.get_coords()
-        for i, lbl in enumerate(self._label_items):
-            x, y = coords[i]
-            lbl.setPos(x + POINT_RADIUS + 30, y - POINT_RADIUS - 30)
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +401,7 @@ class EditorView(QGraphicsView):
                 event.key() == Qt.Key_0 and event.modifiers() & Qt.ControlModifier):
             self.fit_view()
         elif event.key() == Qt.Key_Escape:
-            self.scene().toggle_selected(-1)  # deselect all
+            self.scene().clear_selection()
         else:
             super().keyPressEvent(event)
 
@@ -494,9 +529,8 @@ class PropertiesPanel(QWidget):
         self._rebuild_rows()
 
     def refresh(self):
-        key_to_name = {key: name for name, key in ALL_PROPERTIES}
         for key, name_lbl, val_lbl in self._rows:
-            val, elapsed = self._state.compute_property(key)
+            val, elapsed = self._state.compute_property(key)   # cached per OT
             if self._show_times and isinstance(val, int):
                 val_lbl.setText(f"{val}  ({elapsed:.3f}s)")
             else:
@@ -577,17 +611,21 @@ class InfoPanel(QWidget):
         layout.addWidget(grp_lambda)
 
         layout.addStretch()
+        self._shown_version: Optional[int] = None
 
     def refresh(self):
         coords = self._state.get_coords()
         lines = [f"P{i:2d}: {x:6d}  {y:6d}" for i, (x, y) in enumerate(coords)]
         self._coords_text.setText("\n".join(lines))
 
-        sl = self._state.get_small_lambda()
-        if sl is not None:
+        # the L matrix only depends on the order type
+        if self._shown_version == self._state.ot_version:
+            return
+        self._shown_version = self._state.ot_version
+        L = self._state.get_l_matrix()
+        if L is not None:
             try:
-                L = sl.get_l()
-                n = sl.n
+                n = self._state.n
                 vals = [[int(L[i, j]) for j in range(n)] for i in range(n)]
                 w = max(len(str(v)) for row in vals for v in row)
                 rows = [" ".join(str(v).rjust(w) for v in row) for row in vals]
@@ -655,6 +693,7 @@ def _run_one_step(mode: str, prop: str, direction: str, sl, coords: list) -> lis
             max_steps=1,
             stop_if_improved=True,
             verbose=False,
+            maximize=direction == "maximize",
         ):
             if new_sl.realization:
                 new_val = _count_property(new_sl, prop)
@@ -674,6 +713,7 @@ class OptimizationWorker(QThread):
     """Runs optimization steps in a background thread."""
 
     improvement_found = Signal(list)   # emits new coords list[(x,y)]
+    failed = Signal(str)               # emits the error message; thread ends
 
     def __init__(self, mode: str, prop: str, direction: str, sl, coords: list, parent=None):
         super().__init__(parent)
@@ -692,10 +732,15 @@ class OptimizationWorker(QThread):
         from pyotlib2.core.point_set import PointSet
 
         while not self._stop:
-            result = _run_one_step(
-                self._mode, self._prop, self._direction,
-                copy.copy(self._sl), self._coords,
-            )
+            try:
+                result = _run_one_step(
+                    self._mode, self._prop, self._direction,
+                    copy.copy(self._sl), self._coords,
+                )
+            except Exception as e:
+                # report to the UI instead of dying silently
+                self.failed.emit(f"{type(e).__name__}: {e}")
+                return
             if result is not None:
                 self._coords = result
                 # rebuild sl from new coords
@@ -848,7 +893,7 @@ class ControlPanel(QWidget):
         nav_layout.setSpacing(4)
         self._btn_prev = QPushButton("◀")
         self._btn_prev.setMaximumWidth(36)
-        self._lbl_nav = QLabel("OT 1 von 1")
+        self._lbl_nav = QLabel("OT 1 of 1")
         self._lbl_nav.setAlignment(Qt.AlignCenter)
         self._lbl_nav.setFont(QFont("Arial", 10, QFont.Bold))
         self._btn_next = QPushButton("▶")
@@ -924,7 +969,7 @@ class ControlPanel(QWidget):
         self._btn_next.clicked.connect(fn)
 
     def update_nav(self, index: int, total: int):
-        self._lbl_nav.setText(f"OT {index + 1} von {total}")
+        self._lbl_nav.setText(f"OT {index + 1} of {total}")
         self._grp_nav.setVisible(total > 1)
 
 
@@ -949,10 +994,13 @@ class EditorWindow(QMainWindow):
         self._dirty: bool = False
         self._loading: bool = False
 
+        # model keeps the original coordinates (and point colors, if any)
         if self._all_ots:
-            pts = _normalize_to_grid(self._all_ots[0].realization)
+            pts = list(self._all_ots[0].realization)
+            self._coloring = self._all_ots[0].coloring
         else:
             pts = _load_points(filepath, n=n, fmt=fmt)
+            self._coloring = None
 
         self.state = EditorState(
             pts,
@@ -1010,7 +1058,8 @@ class EditorWindow(QMainWindow):
         self._status = QStatusBar()
         self.setStatusBar(self._status)
         self._status.showMessage(
-            "Left-drag: move point   Right-click: select   Wheel: zoom   Middle-drag: pan"
+            "Left-drag: move point   Right-click: select   Esc: deselect   "
+            "Wheel: zoom   Middle-drag: pan"
         )
 
         self._build_menu()
@@ -1065,8 +1114,8 @@ class EditorWindow(QMainWindow):
         if not self._dirty:
             return True
         msg = QMessageBox(self)
-        msg.setWindowTitle("Ungespeicherte Änderungen")
-        msg.setText("Änderungen liegen vor. Möchten Sie speichern?")
+        msg.setWindowTitle("Unsaved changes")
+        msg.setText("The point set has been modified. Save the changes?")
         msg.setStandardButtons(QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
         msg.setDefaultButton(QMessageBox.Save)
         result = msg.exec()
@@ -1079,12 +1128,12 @@ class EditorWindow(QMainWindow):
         """Load OT at index from _all_ots into the editor."""
         self._ot_index = index
         sl = self._all_ots[index]
-        pts = _normalize_to_grid(sl.realization)
+        self._coloring = sl.coloring
         self._loading = True
-        for i, (x, y) in enumerate(pts):
-            self._scene.move_point(i, x, y)
+        self._scene.set_points(sl.realization)
         self._loading = False
         self._dirty = False
+        self._view.fit_view()
         self._ctrl.update_nav(self._ot_index, len(self._all_ots))
         self._refresh_panels()
 
@@ -1103,10 +1152,9 @@ class EditorWindow(QMainWindow):
         self._load_ot((self._ot_index + 1) % len(self._all_ots))
 
     def _set_points_from_realization(self, coords):
-        """Update all point positions from a new realization (scales to grid)."""
-        pts = _normalize_to_grid(coords)
-        for i, (x, y) in enumerate(pts):
-            self._scene.move_point(i, x, y)
+        """Show a new realization unchanged; only the view is refitted."""
+        self._scene.set_points(coords)
+        self._view.fit_view()
 
     def _get_sl_and_coords(self):
         """Return (sl, coords) or (None, None) if collinear."""
@@ -1160,6 +1208,7 @@ class EditorWindow(QMainWindow):
             import copy
             self._worker = OptimizationWorker(mode, prop, direction, copy.copy(sl), coords)
             self._worker.improvement_found.connect(self._on_improvement)
+            self._worker.failed.connect(self._on_worker_failed)
             self._worker.finished.connect(self._on_worker_finished)
             self._set_canvas_locked(True)
             self._status.showMessage("Auto optimization running…")
@@ -1176,6 +1225,11 @@ class EditorWindow(QMainWindow):
         """Called from main thread when worker finds an improvement."""
         self._set_points_from_realization(coords)
         self._refresh_panels()
+
+    def _on_worker_failed(self, message: str):
+        """Worker raised: tell the user (it stops; _on_worker_finished unlocks)."""
+        self._status.showMessage(f"Auto optimization failed: {message}", 8000)
+        QMessageBox.warning(self, "Optimization failed", message)
 
     def _on_worker_finished(self):
         """Called when worker thread finishes (e.g. after stop)."""
@@ -1201,29 +1255,20 @@ class EditorWindow(QMainWindow):
             self._status.showMessage("Cannot save: collinear points!", 5000)
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save coordinates", "",
-            "ASCII point set (*.asc);;JSON (*.json);;Point binary 8-bit (*.b08)"
+            self, "Save coordinates", "", _SAVE_FILTERS,
         )
         if not path:
             return
-        path = Path(path)
-        suffix = path.suffix.lstrip(".").lower() or "asc"
-        if suffix == "b08":
-            suffix = "pb08"
-
-        coords = self.state.get_coords()
-        from pyotlib2.core.point_set import PointSet
-        ps = PointSet(len(coords), coords)
-        sl = ps.to_small_lambda(lazy=False)
-        sl.realization = list(coords)
-
-        from pyotlib2.io.writers import write_order_types
         try:
-            write_order_types([sl], path, fmt=suffix)
-            self._dirty = False
-            self._status.showMessage(f"Saved: {path}", 4000)
+            _write_points(path, self.state.get_coords(), self._coloring)
+        except ValueError as e:
+            QMessageBox.warning(self, "Cannot save", str(e))
+            return
         except Exception as e:
             self._status.showMessage(f"Save failed: {e}", 6000)
+            return
+        self._dirty = False
+        self._status.showMessage(f"Saved: {path}", 4000)
 
     # ------------------------------------------------------------------
     # Menu
@@ -1299,56 +1344,50 @@ class EditorWindow(QMainWindow):
 _HELP_HTML = """\
 <h2>Editor Controls</h2>
 <ul>
-  <li><b>Left click</b> — select/move point</li>
-  <li><b>Double click</b> — add new point</li>
-  <li><b>Right click</b> — delete point</li>
-  <li><b>Space + drag</b> — pan view</li>
-  <li><b>Mouse wheel / +/-</b> — zoom in/out</li>
-  <li><b>Ctrl+0</b> — fit to window</li>
+  <li><b>Left-drag</b> — move a point (snapped to integer coordinates)</li>
+  <li><b>Right-click</b> on a point — select / deselect it</li>
+  <li><b>Esc</b> — deselect</li>
+  <li><b>Mouse wheel / + / -</b> — zoom in/out</li>
+  <li><b>Middle-drag</b> — pan view</li>
+  <li><b>Home / 0 / Ctrl+0</b> — fit to window</li>
   <li><b>Ctrl+S</b> — save</li>
-  <li><b>Ctrl+Left/Right</b> — previous/next OT (multi-OT mode)</li>
+  <li><b>Ctrl+Left/Right</b> — previous/next OT (multi-OT files)</li>
+  <li><b>F1</b> — this help</li>
 </ul>
 
 <h2>Display Features</h2>
 <ul>
-  <li><b>Convex hull</b> — toggle hull overlay</li>
-  <li><b>Onion layers</b> — nested convex hulls</li>
-  <li><b>Hide incident lines</b> — hide connecting lines through points</li>
-  <li><b>Lock OT</b> — prevent accidental OT changes while dragging</li>
+  <li><b>Highlight</b> — convex hull, onion layers (nested convex layers) or none</li>
+  <li><b>Hide incident lines</b> — fade the lines through the selected point</li>
+  <li><b>Fix OT</b> — a drag that would change the order type (or create
+      collinear points) is refused; the reference is the OT at the moment
+      the checkbox is enabled</li>
+  <li>Points involved in a collinear triple are drawn in red</li>
 </ul>
 
 <h2>Properties Panel</h2>
-<p>Live-computed combinatorial properties (select via Properties button):</p>
+<p>Live-computed combinatorial properties (choose via "Select properties…";
+values are recomputed only when the order type changes):</p>
 <ul>
-  <li>Crossing number, rectilinear crossing number</li>
-  <li>Convex position count, halving lines</li>
-  <li>Empty triangles, empty quadrilaterals</li>
-  <li>Convex k-gons for various k</li>
-  <li>And many more (see Properties dialog)</li>
+  <li>Hull size, crossings, onion layers, triangulations</li>
+  <li>Convex 5-, 6-, 7-gons</li>
+  <li>Empty 3- to 7-holes</li>
 </ul>
 
 <h2>Optimization Modes</h2>
 <ul>
-  <li><b>Minimize coordinates</b> — reduce coordinate size (move-to-even / halve)</li>
-  <li><b>Beautify coordinates</b> — gradient descent or Nelder-Mead beautification</li>
-  <li><b>Property min/max</b> — local search to optimize a chosen property</li>
+  <li><b>Coordinate Minimization</b> — reduce coordinate size, OT preserved</li>
+  <li><b>Beautification</b> — gradient-descent beautification, OT preserved</li>
+  <li><b>Property Min/Max</b> — random local search (walk-points) on the
+      chosen property; the OT may change</li>
 </ul>
-
-<h2>Navigation (Multi-OT)</h2>
-<ul>
-  <li><b>Ctrl+Left</b> — previous order type</li>
-  <li><b>Ctrl+Right</b> — next order type</li>
-  <li>Status bar shows current index and total count</li>
-</ul>
+<p>"1 Step" runs one iteration, "Auto" runs in the background until toggled off.</p>
 
 <h2>File Formats</h2>
-<ul>
-  <li><b>.sl</b> — SmallLambda (compact binary, abstract only)</li>
-  <li><b>.bl</b> — BigLambda (variable-width binary, abstract only)</li>
-  <li><b>.pts</b> — PointSet (integer coordinates)</li>
-  <li><b>.fm</b> — FelsnerMatrix (crossing-family matrix)</li>
-  <li><b>.json</b> — JSON point sets</li>
-</ul>
+<p>Any file with coordinates can be opened (e.g. .asc, .psz, .json,
+.b08/.pb08, .b16/.pb16); coordinates are kept exactly as loaded.
+Save formats: .asc, .psz, .json, .b08 (coordinates 0..255),
+.b16 (0..65535).  Point colors (.asc/.psz) are preserved.</p>
 """
 
 
@@ -1408,7 +1447,8 @@ def _load_order_types(filepath, *, n=None, fmt=None) -> list:
 
 
 def _load_points(filepath, *, n=None, fmt=None) -> list[tuple[int, int]]:
-    """Load points from file → integer grid coords. Falls back to default."""
+    """Load the first point set from file (coordinates unchanged).
+    Falls back to the default points."""
     if filepath is not None:
         path = Path(filepath)
         if path.exists():
@@ -1421,29 +1461,44 @@ def _load_points(filepath, *, n=None, fmt=None) -> list[tuple[int, int]]:
                     kw["fmt"] = fmt
                 ots = list(read_order_types(path, **kw))
                 if ots and ots[0].realization:
-                    return _normalize_to_grid(ots[0].realization)
+                    return [(int(x), int(y)) for x, y in ots[0].realization]
             except Exception as e:
                 import sys
                 print(f"Warning: could not load {filepath}: {e}", file=sys.stderr)
     return _default_points(6)
 
 
-def _normalize_to_grid(pts: list) -> list[tuple[int, int]]:
-    """Scale a point set to fit in [margin, GRID_MAX-margin]², y-flipped."""
-    margin = int(GRID_MAX * 0.05)
-    usable = GRID_MAX - 2 * margin
-    xs = [float(x) for x, y in pts]
-    ys = [float(y) for x, y in pts]
-    xlo, xhi = min(xs), max(xs)
-    ylo, yhi = min(ys), max(ys)
-    span = max(xhi - xlo, yhi - ylo) or 1.0
-    result = []
-    for x, y in pts:
-        nx = int(round(margin + (x - xlo) / span * usable))
-        # flip y: math y up → screen y down
-        ny = int(round(margin + (1.0 - (y - ylo) / span) * usable))
-        result.append((nx, ny))
-    return result
+_SAVE_FILTERS = (
+    "ASCII point set (*.asc);;PoSeZo point set (*.psz);;JSON (*.json);;"
+    "Point binary 8-bit (*.b08);;Point binary 16-bit (*.b16)"
+)
+
+# point binary formats → bits per coordinate (unsigned)
+_BINARY_BITS = {"pb04": 4, "b08": 8, "pb08": 8, "b16": 16, "pb16": 16, "pb32": 32}
+
+
+def _write_points(path, coords: list[tuple[int, int]], coloring=None) -> None:
+    """Write the model coordinates to *path* (format from the extension,
+    default .asc).  Raises ValueError with a readable message if the
+    coordinates do not fit a binary format."""
+    path = Path(path)
+    fmt = path.suffix.lstrip(".").lower() or "asc"
+    bits = _BINARY_BITS.get(fmt)
+    if bits is not None:
+        lo = min(v for p in coords for v in p)
+        hi = max(v for p in coords for v in p)
+        top = 2 ** bits - 1
+        if lo < 0 or hi > top:
+            wider = ".b16 or .asc" if bits < 16 else ".asc"
+            raise ValueError(
+                f"Coordinates range from {lo} to {hi}, but .{fmt} only stores "
+                f"0..{top}.  Save as {wider} instead, or run "
+                f"Coordinate Minimization first."
+            )
+    from pyotlib2.core.point_set import PointSet
+    from pyotlib2.io.writers import write_order_types
+    sl = PointSet(len(coords), list(coords), coloring=coloring).to_small_lambda(lazy=False)
+    write_order_types([sl], path, fmt=fmt)
 
 
 def _default_points(n: int) -> list[tuple[int, int]]:

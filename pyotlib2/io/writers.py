@@ -332,8 +332,10 @@ def _write_point_text_asc(
         for ot in ots:
             assert ot.realization is not None
             f.write(f"{ot.n}\n")
-            for x, y in ot.realization:
-                f.write(f"{x} {y}\n")
+            for i, (x, y) in enumerate(ot.realization):
+                # bicolored point sets (PoSeZo c2): "x y COLOR", as read back
+                color = (ot.coloring or {}).get(i)
+                f.write(f"{x} {y}\n" if color is None else f"{x} {y} {color}\n")
             cnt += 1
     return cnt
 

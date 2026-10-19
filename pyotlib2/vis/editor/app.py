@@ -8,11 +8,11 @@ or programmatically:
 
 Features
 --------
-- Drag points with mouse
-- Status bar shows current order type (SmallLambda fingerprint)
-- OT-lock indicator: turns red when dragging would change the order type
-- Convex hull highlighted in blue
-- Point labels
+- Drag points with the mouse (integer coordinates, kept exactly as loaded)
+- Info panel: coordinates, SmallLambda rank matrix and checksum
+- OT lock: drags that would change the order type are refused
+- Convex hull / onion layer overlay, point labels, collinear points in red
+- Live properties, optimization (minimize / beautify / property walk)
 - Save current configuration (File > Save)
 """
 
