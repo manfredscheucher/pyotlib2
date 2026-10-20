@@ -16,9 +16,8 @@ These functions are independent of the (non-literal) ports
 ``pyotlib2.cli.commands``.
 
 NOT ported:
-  * ``simanMinimize`` (PointSetOptimizer.py:543): it needs
-    ``PyDCG.heuristics.simmulated_annealing_iterator``, which is missing from
-    the PyDCG source in old/PyDCG (see pyotlib2.algorithms.pydcg_heuristics).
+  * ``simanMinimize`` (PointSetOptimizer.py:543): it is built on PyDCG,
+    which pyotlib2 does not use.
   * ``Beautify350Wrapper.call_beautify350``: calls the external executable
     ``beautify350`` whose source is not available.
 """

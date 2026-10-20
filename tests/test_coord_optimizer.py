@@ -2,7 +2,7 @@
 
 Covers pyotlib2.algorithms.coord_optimizer (minimizeIntegerCoordinates,
 beautifyPointSet, beautify2, MinimizePatternSearch), symmetry,
-pattern_search, pydcg_heuristics and the CLI wrappers.
+pattern_search and the CLI wrappers.
 """
 
 import random
@@ -13,7 +13,6 @@ import pytest
 
 from pyotlib2.algorithms import coord_optimizer as co
 from pyotlib2.algorithms.pattern_search import my_pattern_search
-from pyotlib2.algorithms.pydcg_heuristics import P, kirkpatrick_cooling, rand_move
 from pyotlib2.algorithms.symmetry import compute_symmetric_ps
 from pyotlib2.core.point_set import PointSet
 
@@ -157,7 +156,7 @@ class TestMinimizePatternSearch:
 
 
 # ---------------------------------------------------------------------------
-# helpers: symmetry, pattern search, PyDCG heuristics, cocircularity
+# helpers: symmetry, pattern search, cocircularity
 # ---------------------------------------------------------------------------
 
 def test_compute_symmetric_ps():
@@ -169,29 +168,6 @@ def test_my_pattern_search_quadratic():
     f = lambda X: sum((X[i] - i) ** 2 for i in range(len(X)))
     res = my_pattern_search(f, [0.0] * 4, 0.1, maxiter=300)
     assert res["f0"] < 1e-6
-
-
-def test_kirkpatrick_cooling():
-    g = kirkpatrick_cooling(100, 0.5)
-    assert [next(g) for _ in range(3)] == [100, 50, 25]
-
-
-def test_acceptance_P():
-    assert P(5, 4, 1.0)              # improvement always accepted
-    assert P(5, 5, 1.0)              # equal accepted
-    assert P(4, 5, 1.0, minimize=False)
-    random.seed(0)
-    assert not P(0, 1000, 1e-9)      # exp(-huge) ~ 0
-
-
-def test_rand_move_seeded():
-    random.seed(5)
-    p = [0, 0]
-    rand_move(p, 100)
-    random.seed(5)
-    q = [0, 0]
-    rand_move(q, 100)
-    assert p == q and isinstance(p[0], int)
 
 
 def test_has_cocircular_points():
