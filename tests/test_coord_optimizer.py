@@ -208,3 +208,40 @@ def test_cli(argv, tmp_path, monkeypatch, capsys):
 def test_symmetry_uses_python2_rounding():
     from pyotlib2.algorithms.symmetry import _round_py2
     assert [_round_py2(v) for v in (2.5, -2.5, 0.5, 1.4, -1.6)] == [3, -3, 1, 1, -2]
+
+
+def test_minimize_ensure_property_changes_order_type():
+    from pyotlib2.cli.commands import _count_property
+    random.seed(3)
+    pts = [(random.randint(0, 10**6), random.randint(0, 10**6)) for _ in range(9)]
+    c0 = _count_property(_ps(pts).to_small_lambda(lazy=False), "crossings")
+    random.seed(3)
+    r = co.minimize_integer_coordinates(_ps(list(pts)), maxtrials=2, ensure_property="crossings")
+    assert r.bits() < _ps(pts).bits()
+    assert not r.has_collinear_points()
+    assert _count_property(r.to_small_lambda(lazy=False), "crossings") <= c0
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_cli_prop_never_worse(seed, tmp_path, monkeypatch):
+    from pyotlib2.cli.commands import _count_property
+    from pyotlib2.cli.main import main
+    from pyotlib2.io.readers import read_order_types
+    from pyotlib2.io.writers import write_order_types
+
+    random.seed(seed)
+    pts = [(random.randint(0, 10**5), random.randint(0, 10**5)) for _ in range(8)]
+    if _ps(pts).has_collinear_points():
+        pytest.skip("collinear start")
+    c0 = _count_property(_ps(pts).to_small_lambda(lazy=False), "empty-triangles")
+    inp = tmp_path / "in.psz"
+    out = tmp_path / "out.psz"
+    write_order_types([_ps(pts).to_small_lambda(lazy=False)], inp, fmt="psz")
+    monkeypatch.setattr(sys, "argv", ["pyotlib2", "minimize-integer-coords", str(inp), "-n", "8",
+                                      "--maxtrials", "2", "--prop", "empty-triangles", "-o", str(out)])
+    main()
+    (res,) = list(read_order_types(str(out), n=8))
+    ps = _ps(list(res.realization))
+    assert not ps.has_collinear_points()
+    assert _count_property(ps.to_small_lambda(lazy=False), "empty-triangles") <= c0
+    assert ps.bits() <= _ps(pts).bits()

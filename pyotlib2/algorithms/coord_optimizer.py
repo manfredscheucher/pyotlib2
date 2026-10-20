@@ -16,8 +16,6 @@ These functions are independent of the (non-literal) ports
 ``pyotlib2.cli.commands``.
 
 NOT ported:
-  * ``simanMinimize`` (PointSetOptimizer.py:543): it is built on PyDCG,
-    which pyotlib2 does not use.
   * ``Beautify350Wrapper.call_beautify350``: calls the external executable
     ``beautify350`` whose source is not available.
 """
@@ -273,10 +271,9 @@ def _is_valid_point_set(n, BL, PS, i, ensure_property) -> bool:
         if not ensure_property:
             return False
         else:
-            # NOTE (original): the ensure_property branch is disabled by this
-            # assert ("TODO: implement faster, currently really too slow");
-            # the code below it is unreachable but kept literally.
-            assert not ensure_property
+            # NOTE (original): the old code disabled this branch with
+            # assert(not ensure_property) ("TODO: implement faster, currently
+            # really too slow"); the assert is dropped here, the rest is literal.
             if PS.has_collinear_points():
                 return False
             from pyotlib2.cli.commands import _count_property
@@ -432,7 +429,9 @@ def _minimize_integer_coordinates_priv(quality_function, PS, BL, SLstr, maxtrial
                 print("GOT smaller coords but cocircular points... :/")
             return PS
 
-    assert PS_new.to_small_lambda().to_string() == SLstr  # optimization failed?!
+    # NOTE: with ensure_property the order type may change, so the original's
+    # order-type assert only applies without it.
+    assert ensure_property or PS_new.to_small_lambda().to_string() == SLstr  # optimization failed?!
     return PS_new
 
 

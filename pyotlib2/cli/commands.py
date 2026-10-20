@@ -2322,7 +2322,9 @@ def _register_minimize_integer_coords(sub) -> None:
     p.add_argument("--symmetric", type=int, default=0,
                    help="k-fold rotational symmetry to keep (default: 0 = none)")
     p.add_argument("--prop", default="",
-                   help="Property to keep when minimizing (old code asserts this off; default: none)")
+                   help="Minimize w.r.t. this property (see _count_property): the order type "
+                        "may change as long as the property count does not increase "
+                        "(default: none = keep the order type)")
     p.add_argument("--transformation", default="[1,0,0,1]",
                    help="Linear map [a,b,c,d]: (x,y) -> (a*x+b*y, c*x+d*y) applied first "
                         "(default: [1,0,0,1])")
@@ -2379,13 +2381,26 @@ def _cmd_minimize_integer_coords(args) -> None:
             if args.symmetric:
                 PS.points = compute_symmetric_ps(PS.points, args.symmetric)
 
+            if args.prop:
+                # minimize w.r.t. property: a result whose count got worse (or with
+                # collinear points) is undone
+                worse = PS.has_collinear_points() or (
+                    _count_property(PS.to_small_lambda(lazy=False), args.prop)
+                    > _count_property(PointSet(OT.n, OT.realization).to_small_lambda(lazy=False), args.prop))
+                if worse:
+                    PS.points = OT.realization  # backup
+
             if PS.diameter() < PointSet(OT.n, OT.realization).diameter():
                 OT.realization = PS.points
             else:
                 PS.points = OT.realization  # backup
 
-            OTstr = PointSet(OT.n, OT.realization).to_small_lambda().to_string()
-            assert OTstr == OTstr0
+            if args.prop:
+                # the order type may have changed: rebuild it from the realization
+                OT = PointSet(OT.n, OT.realization, OT.coloring).to_small_lambda()
+            else:
+                OTstr = PointSet(OT.n, OT.realization).to_small_lambda().to_string()
+                assert OTstr == OTstr0
 
         end_bits = PS.bits()
 
